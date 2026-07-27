@@ -102,3 +102,20 @@ def apply_lcm_model_route(call_kwargs: dict, model: str | None) -> None:
             route.provider or "(task default)",
             route.model,
         )
+
+
+def apply_lcm_reasoning_effort(call_kwargs: dict, effort: str | None) -> None:
+    """Apply an LCM-specific reasoning-effort override to auxiliary kwargs."""
+    normalized = (effort or "").strip().lower()
+    if not normalized:
+        return
+    valid_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    if normalized not in valid_efforts:
+        logger.warning("Ignoring unsupported LCM reasoning effort: %r", effort)
+        return
+    extra_body = dict(call_kwargs.get("extra_body") or {})
+    if normalized == "none":
+        extra_body["reasoning"] = {"enabled": False, "effort": "none"}
+    else:
+        extra_body["reasoning"] = {"effort": normalized}
+    call_kwargs["extra_body"] = extra_body

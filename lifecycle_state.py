@@ -14,7 +14,9 @@ import functools
 import sqlite3
 import threading
 import time
+import threading
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
 
@@ -862,8 +864,6 @@ class LifecycleStateStore:
             assert conn is not None
             # MAX() in SQL keeps the advance monotonic even if a concurrent
             # writer bumped the frontier between the read above and this write.
-            # A Python-side max() over the stale read could otherwise regress
-            # the checkpoint and force the same range to be compacted twice.
             cursor = conn.execute(
                 """
                 UPDATE lcm_lifecycle_state

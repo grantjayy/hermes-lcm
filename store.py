@@ -1561,3 +1561,42 @@ class MessageStore:
             self.close()
         except Exception:
             pass
+
+
+def _synchronized(method):
+    """Serialize every operation on the shared SQLite connection."""
+    def locked(self, *args, **kwargs):
+        with self._write_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+for _method_name in (
+    "append",
+    "append_batch",
+    "_append_protected_batch",
+    "reassign_session_messages",
+    "delete_session_messages",
+    "gc_externalized_tool_result",
+    "pin",
+    "unpin",
+    "get",
+    "get_batch",
+    "get_range",
+    "count_session_load_messages",
+    "load_session_page",
+    "get_session_messages",
+    "get_session_messages_after",
+    "get_session_tail",
+    "get_session_count",
+    "get_session_token_total",
+    "get_source_stats",
+    "get_source_normalization_plan",
+    "normalize_legacy_blank_sources",
+    "get_time_bounds",
+    "search",
+    "_search_like",
+    "close",
+):
+    setattr(MessageStore, _method_name, _synchronized(getattr(MessageStore, _method_name)))

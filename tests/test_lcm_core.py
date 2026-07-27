@@ -7243,6 +7243,219 @@ class TestLCMEngineCloning:
             if clone is not None:
                 clone.shutdown()
 
+    def test_clones_share_one_storage_bundle_with_independent_runtime_state(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-shared-storage.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clones = [prototype.clone_for_agent() for _ in range(8)]
+        try:
+            for clone in clones:
+                assert clone._store is prototype._store
+                assert clone._dag is prototype._dag
+                assert clone._lifecycle is prototype._lifecycle
+
+            clones[0].on_session_start("first-session", conversation_id="first-conversation")
+            clones[1].on_session_start("second-session", conversation_id="second-conversation")
+            assert clones[0]._session_id == "first-session"
+            assert clones[1]._session_id == "second-session"
+            assert prototype._session_id == ""
+        finally:
+            for engine in (*clones, prototype):
+                engine.shutdown()
+
+    def test_shared_storage_closes_once_after_final_owner_shutdown(self, tmp_path, monkeypatch):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-shared-close.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        first_agent = prototype.clone_for_agent()
+        second_agent = prototype.clone_for_agent()
+        helpers = (prototype._store, prototype._dag, prototype._lifecycle)
+        close_counts = {id(helper): 0 for helper in helpers}
+        for helper in helpers:
+            original_close = helper.close
+
+            def counted_close(*, _helper=helper, _close=original_close):
+                close_counts[id(_helper)] += 1
+                _close()
+
+            monkeypatch.setattr(helper, "close", counted_close)
+
+        first_agent.shutdown()
+        prototype._store.append("still-open", {"role": "user", "content": "survives clone close"})
+        prototype.shutdown()
+        assert all(count == 0 for count in close_counts.values())
+
+        second_agent.shutdown()
+        second_agent.shutdown()
+        assert all(count == 1 for count in close_counts.values())
+        assert all(helper._conn is None for helper in helpers)
+
+    def test_concurrent_clones_share_storage_without_mixing_sessions(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-concurrent-clones.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clones = [prototype.clone_for_agent() for _ in range(6)]
+        barrier = threading.Barrier(len(clones))
+        errors = []
+
+        def write_session(index, clone):
+            try:
+                session_id = f"session-{index}"
+                conversation_id = f"conversation-{index}"
+                barrier.wait()
+                clone._lifecycle.bind_session(session_id, conversation_id=conversation_id)
+                clone._store.append(
+                    session_id,
+                    {"role": "user", "content": f"message-{index}"},
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=write_session, args=(index, clone))
+            for index, clone in enumerate(clones)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            assert errors == []
+            rows = prototype._store.get_session_messages("session-3")
+            assert [row["content"] for row in rows] == ["message-3"]
+            for index in range(len(clones)):
+                state = prototype._lifecycle.get_by_conversation(f"conversation-{index}")
+                assert state is not None
+                assert state.current_session_id == f"session-{index}"
+        finally:
+            for engine in (*clones, prototype):
+                engine.shutdown()
+
+    def test_concurrent_clone_dag_writes_are_serialized(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-concurrent-dag.db"))
+        prototype = LCMEngine(config=config)
+        clones = [prototype.clone_for_agent() for _ in range(8)]
+        barrier = threading.Barrier(len(clones))
+        errors = []
+
+        def write_nodes(index, clone):
+            try:
+                barrier.wait()
+                for ordinal in range(50):
+                    clone._dag.add_node(SummaryNode(
+                        session_id=f"session-{index}",
+                        summary=f"node-{index}-{ordinal}",
+                    ))
+                    clone._dag.get_session_depth_stats(f"session-{index}")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=write_nodes, args=(index, clone))
+            for index, clone in enumerate(clones)
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            assert errors == []
+            assert sum(prototype._dag.get_session_node_count(f"session-{i}") for i in range(8)) == 400
+        finally:
+            for engine in (*clones, prototype):
+                engine.shutdown()
+
+    def test_same_engine_concurrent_shutdown_releases_one_owner(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        prototype = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "shutdown-race.db")))
+        clone = prototype.clone_for_agent()
+        storage = prototype._storage
+        barrier = threading.Barrier(12)
+        threads = [threading.Thread(target=lambda: (barrier.wait(), prototype.shutdown())) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert storage._owners == 1
+        clone._store.append("live", {"role": "user", "content": "still open"})
+        clone.shutdown()
+        assert storage._closed is True
+
+    def test_clone_failure_rolls_back_acquired_owner(self, tmp_path, monkeypatch):
+        from hermes_lcm.engine import LCMEngine
+
+        prototype = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "failed-clone.db")))
+        storage = prototype._storage
+        monkeypatch.setattr(LCMEngine, "_set_context_length", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("copy failed")))
+        prototype.raw_context_length = 1000
+        prototype._context_length_source = "test"
+
+        with pytest.raises(RuntimeError, match="copy failed"):
+            prototype.clone_for_agent()
+
+        assert storage._owners == 1
+        prototype.shutdown()
+        assert storage._closed is True
+
+    def test_abandoned_clone_finalizer_releases_owner(self, tmp_path):
+        import gc
+        import weakref
+        from hermes_lcm.engine import LCMEngine
+
+        prototype = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "abandoned-clone.db")))
+        storage = prototype._storage
+        clone = prototype.clone_for_agent()
+        clone_ref = weakref.ref(clone)
+        del clone
+        gc.collect()
+
+        assert clone_ref() is None
+        assert storage._owners == 1
+        prototype.shutdown()
+        assert storage._closed is True
+
+    def test_final_release_attempts_every_helper_close_and_collects_failures(self, tmp_path, monkeypatch):
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "close-errors.db")))
+        storage = engine._storage
+        calls = []
+        helpers = (storage.store, storage.dag, storage.lifecycle)
+        for index, helper in enumerate(helpers):
+            def failing_close(*, _index=index):
+                calls.append(_index)
+                if _index != 1:
+                    raise RuntimeError(f"close-{_index}")
+            monkeypatch.setattr(helper, "close", failing_close)
+
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            engine.shutdown()
+
+        assert [str(exc) for exc in exc_info.value.exceptions] == ["close-0", "close-2"]
+
+        assert calls == [0, 1, 2]
+        assert storage._closed is True
+        engine.shutdown()
+        assert calls == [0, 1, 2]
+
+    def test_clone_after_shutdown_is_rejected_without_acquiring_owner(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "clone-after-close.db")))
+        storage = engine._storage
+        engine.shutdown()
+
+        with pytest.raises(RuntimeError, match="shut down"):
+            engine.clone_for_agent()
+        assert storage._owners == 0
     def test_deepcopy_uses_clone_for_agent_without_copying_sqlite_handles(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
 
@@ -7254,9 +7467,9 @@ class TestLCMEngineCloning:
 
             assert clone is not prototype
             assert isinstance(clone, LCMEngine)
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._config.database_path == prototype._config.database_path
             assert clone._hermes_home == prototype._hermes_home
         finally:
@@ -7297,9 +7510,9 @@ class TestLCMEngineCloning:
             assert isinstance(clone, LCMEngine)
             assert clone.name == "lcm"
             assert clone is not prototype
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._session_id == ""
             assert clone._conversation_id == ""
             assert clone.model == prototype.model
