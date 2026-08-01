@@ -39,4 +39,7 @@ def test_empty_reasoning_effort_preserves_request_defaults():
 def test_reasoning_effort_request_payload(effort, expected):
     kwargs = {"extra_body": {"existing": True}}
     apply_lcm_reasoning_effort(kwargs, effort)
-    assert kwargs["extra_body"] == {"existing": True, "reasoning": expected}
+    assert kwargs == {
+        "extra_body": {"existing": True},
+        "reasoning_config": expected,
+    }

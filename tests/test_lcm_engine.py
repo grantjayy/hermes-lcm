@@ -1483,6 +1483,52 @@ class TestEscalationStripReasoning:
         assert "</think>" not in result
         assert "We discussed the docker rollout plan" in result
 
+    @pytest.mark.parametrize(
+        "effort,expected",
+        [
+            ("high", {"effort": "high"}),
+            ("none", {"enabled": False, "effort": "none"}),
+            ("", None),
+        ],
+    )
+    def test_synthesize_expansion_routes_reasoning_config_to_hermes(
+        self, monkeypatch, effort, expected
+    ):
+        import hermes_lcm.tools as tools_mod
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            response = ModuleType("response")
+            message = ModuleType("message")
+            message.content = "expanded answer"
+            choice = ModuleType("choice")
+            choice.message = message
+            response.choices = [choice]
+            return response
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        monkeypatch.setattr(
+            tools_mod,
+            "apply_lcm_model_route",
+            lambda kwargs, model: kwargs.update(extra_body={"unrelated": True}),
+        )
+
+        result = tools_mod._synthesize_expansion_answer(
+            prompt="What was discussed?",
+            context_blocks=[{"role": "user", "content": "context"}],
+            model="any",
+            reasoning_effort=effort,
+            max_tokens=200,
+            timeout=10.0,
+        )
+
+        assert result == "expanded answer"
+        assert seen["extra_body"] == {"unrelated": True}
+        assert seen.get("reasoning_config") == expected
+        assert "reasoning" not in seen["extra_body"]
+
 
     def test_call_extraction_llm_strips_reasoning_from_response(self, monkeypatch):
         """Integration: pre-compaction extraction routes through
