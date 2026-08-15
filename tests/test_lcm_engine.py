@@ -11225,6 +11225,104 @@ class TestEngineCompress:
         assert parent.earliest_at == child_windows[0][0]
         assert parent.latest_at == child_windows[-1][1]
 
+    @pytest.mark.parametrize("configured_effort", ["high", ""])
+    def test_leaf_compaction_routes_configured_summary_reasoning_effort(
+        self, tmp_path, monkeypatch, configured_effort
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=50,
+            summary_reasoning_effort=configured_effort,
+            database_path=str(tmp_path / "lcm_leaf_reasoning_effort.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        import hermes_lcm.engine as engine_module
+
+        captured: dict = {}
+
+        def capture_summary(**kwargs):
+            captured.update(kwargs)
+            return "Leaf summary.\nExpand for details about: oldest raw chunk", 1
+
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", capture_summary)
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(6):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"Message {i}: " + ("chunk " * 35),
+            })
+
+        engine.compress(messages)
+
+        assert engine._dag.get_session_nodes("test-session")
+        # Empty stays empty so the task/provider default keeps deciding effort.
+        assert captured["reasoning_effort"] == configured_effort
+        # Effort rides alongside the routing already forwarded here.
+        assert captured["model"] == config.summary_model
+        assert captured["fallback_models"] == config.summary_fallback_models
+        assert captured["timeout"] == config.summary_timeout_ms / 1000
+        assert captured["l2_budget_ratio"] == config.l2_budget_ratio
+        assert captured["l3_truncate_tokens"] == config.l3_truncate_tokens
+        assert captured["custom_instructions"] == config.custom_instructions
+        assert isinstance(captured["focus_topic"], str)
+
+    @pytest.mark.parametrize("configured_effort", ["high", ""])
+    def test_condensation_routes_configured_summary_reasoning_effort(
+        self, tmp_path, monkeypatch, configured_effort
+    ):
+        config = LCMConfig(
+            summary_reasoning_effort=configured_effort,
+            database_path=str(tmp_path / "lcm_condense_reasoning_effort.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        for idx in range(config.condensation_fanin):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=f"child {idx}",
+                token_count=10,
+                source_ids=[idx + 1],
+                source_type="messages",
+                created_at=1_900_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_010 + idx,
+            ))
+
+        import hermes_lcm.engine as engine_module
+
+        captured: dict = {}
+
+        def capture_summary(**kwargs):
+            captured.update(kwargs)
+            return "Parent summary.\nExpand for details about: condensed children", 1
+
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", capture_summary)
+
+        engine._maybe_condense()
+
+        nodes = engine._dag.get_session_nodes("test-session")
+        assert any(node.depth == 1 for node in nodes)
+        # Empty stays empty so the task/provider default keeps deciding effort.
+        assert captured["reasoning_effort"] == configured_effort
+        # Effort rides alongside the routing already forwarded here.
+        assert captured["model"] == config.summary_model
+        assert captured["fallback_models"] == config.summary_fallback_models
+        assert captured["timeout"] == config.summary_timeout_ms / 1000
+        assert captured["l2_budget_ratio"] == config.l2_budget_ratio
+        assert captured["l3_truncate_tokens"] == config.l3_truncate_tokens
+        assert captured["custom_instructions"] == config.custom_instructions
+        assert isinstance(captured["focus_topic"], str)
+
     def test_dynamic_leaf_chunk_sizing_compacts_only_oldest_bounded_raw_chunk(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
