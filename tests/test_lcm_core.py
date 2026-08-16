@@ -51,8 +51,8 @@ class TestFocusBriefFormatting:
 
         assert topic in brief
         assert "Replacement index" not in brief
-        assert "## Historical Task Snapshot" in brief
-        assert "mark them under one of these historical headings:" in brief
+        assert "## Historical or Superseded Context" in brief
+        assert "Place non-current work under" in brief
 
     def test_l2_focus_brief_preserves_literal_braces_in_focus_topic(self):
         topic = "Reconcile tool output with braces: {'force': true, 'topic': '{markers}'}"
@@ -60,8 +60,8 @@ class TestFocusBriefFormatting:
         brief = _build_l2_focus_brief(topic)
 
         assert topic in brief
-        assert "## Historical Remaining Work" in brief
-        assert "Place non-current work under:" in brief
+        assert "## Historical or Superseded Context" in brief
+        assert "Place non-current work under" in brief
 
 
 class TestModelRouting:
@@ -4327,18 +4327,17 @@ class TestEscalation:
         assert "Primary focus: database migrations" in prompt
         assert "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus." in prompt
         assert "Demote old / completed topics:" in prompt
-        assert "STALE context" in prompt
-        assert "must NOT resume" in prompt
-        assert "## Historical Task Snapshot" in prompt
-        assert "## Historical Remaining Work" in prompt
-        assert "## Completed Actions (historical)" not in prompt
-        assert (
-            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
-            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
-        ) in prompt
+        assert "must not resume stale work" in prompt
+        assert "## Historical or Superseded Context" in prompt
         # Blocker / handoff exception
-        assert "Exception: active blockers or handoff state should NOT be demoted" in prompt
-        assert "Keep blockers and pending handoffs outside historical headings" in prompt
+        assert "Exception: active blockers or pending handoff state remain current" in prompt
+        assert "Keep those items outside the historical section" in prompt
+        # Benchmarked checkpoint template structure
+        assert "continuation checkpoint" in prompt
+        assert "SOURCE MATERIAL" in prompt
+        assert "END SOURCE MATERIAL" in prompt
+        assert "## Current State" in prompt
+        assert "## Open Items" in prompt
 
     def test_focus_topic_builds_structured_l2_brief(self):
         from hermes_lcm.escalation import _build_l2_prompt
@@ -4352,23 +4351,26 @@ class TestEscalation:
         assert "Keep other active tasks only when they are current blockers or handoff state." in prompt
         # Demote + blocker exception
         assert "Demote old / completed topics:" in prompt
-        assert "## Completed Actions (historical)" not in prompt
-        assert (
-            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
-            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
-        ) in prompt
-        assert "Exception: active blockers and pending handoff state should NOT be demoted" in prompt
-        assert "Keep them outside historical headings so the agent retains awareness" in prompt
+        assert "## Historical or Superseded Context" in prompt
+        assert "Exception: active blockers and pending handoff state remain current" in prompt
+        assert "Keep those items outside the historical section" in prompt
+        # Benchmarked checkpoint template structure
+        assert "aggressively compact continuation checkpoint" in prompt
+        assert "SOURCE MATERIAL" in prompt
+        assert "END SOURCE MATERIAL" in prompt
 
-    def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
+    def test_focus_topic_multiline_blocks_are_preserved_in_prompts(self):
+        # The benchmarked prompt passes engine-derived multi-line
+        # "Recent user focus:" blocks through unchanged.
         from hermes_lcm.escalation import _build_l1_prompt
-        noisy_focus = "  migration\n\n" + ("very-long-topic " * 40)
-        prompt = _build_l1_prompt("test content", 500, depth=0, focus_topic=noisy_focus)
-        primary_focus_line = next(line for line in prompt.splitlines() if line.startswith("Primary focus:"))
-        assert "\n" not in primary_focus_line
-        assert "migration very-long-topic" in primary_focus_line
-        assert len(primary_focus_line) <= 180
-        assert primary_focus_line.endswith("…")
+        focus = "Recent user focus:\n- fix the gateway\n- rerun the benchmark"
+        prompt = _build_l1_prompt("test content", 500, depth=0, focus_topic=focus)
+        assert "Primary focus: Recent user focus:\n- fix the gateway\n- rerun the benchmark" in prompt
+        # Focus brief sits immediately before the source fence
+        fence = "\nSOURCE MATERIAL\n---\n"
+        assert fence in prompt
+        assert prompt.index("Focus brief:") < prompt.index(fence)
+        assert prompt.rstrip().endswith("END SOURCE MATERIAL")
 
     def test_custom_instructions_injected_into_l1_prompt(self):
         from hermes_lcm.escalation import _build_l1_prompt
