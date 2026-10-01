@@ -27,6 +27,9 @@ ProviderResolver = Callable[[str], bool]
 # same way, but canonical built-ins such as ``custom:openai-codex/...`` remain
 # model-only to avoid accidentally selecting the built-in provider.
 _PROVIDER_PREFIXES = frozenset({"cerebras"})
+# Hermes routes these natively without a registry or ``providers:`` entry.
+# ``openrouter/z-ai/glm-5.2`` -> provider ``openrouter``, model ``z-ai/glm-5.2``.
+_NATIVE_AUX_PROVIDERS = frozenset({"openrouter"})
 
 
 def _provider_route_is_resolvable(provider: str) -> bool:
@@ -38,6 +41,8 @@ def _provider_route_is_resolvable(provider: str) -> bool:
         provider = provider.split(":", 1)[1].strip()
         if not provider:
             return False
+    if provider in _NATIVE_AUX_PROVIDERS:
+        return True
 
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY

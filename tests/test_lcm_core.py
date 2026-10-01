@@ -119,6 +119,16 @@ class TestModelRouting:
         assert route.provider == "my-provider"
         assert route.model == "model-a"
 
+    def test_openrouter_prefix_routes_to_native_openrouter(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(monkeypatch)
+
+        route = parse_lcm_model_override("openrouter/z-ai/glm-5.2")
+
+        assert route.provider == "openrouter"
+        assert route.model == "z-ai/glm-5.2"
+
     def test_canonical_provider_name_stays_model_only_even_if_custom_config_exists(self, monkeypatch):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
