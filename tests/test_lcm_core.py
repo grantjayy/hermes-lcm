@@ -451,6 +451,38 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert (second_summary, second_level) == ("fallback summary", 1)
         assert calls == ["primary-model", "fallback-model", "fallback-model"]
 
+    def test_rejected_summary_of_tiny_source_keeps_route_closed(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummaryCircuitBreaker
+
+        breaker = SummaryCircuitBreaker(failure_threshold=2, cooldown_seconds=300)
+        long_summary = "a summary that is longer than the tiny source " * 4
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            return long_summary
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        tiny_source = '[TOOL RESULT call_1]: {"total_count": 0}'
+        tiny_summary, tiny_level = escalation.summarize_with_escalation(
+            tiny_source,
+            source_tokens=9,
+            token_budget=2000,
+            model="primary-model",
+            circuit_breaker=breaker,
+        )
+        large_summary, large_level = escalation.summarize_with_escalation(
+            "source text " * 400,
+            source_tokens=800,
+            token_budget=200,
+            model="primary-model",
+            circuit_breaker=breaker,
+        )
+
+        assert (tiny_summary, tiny_level) == (tiny_source, 3)
+        assert breaker.allows("primary-model")
+        assert (large_summary, large_level) == (long_summary, 1)
+
     def test_spend_guard_trips_and_backs_off(self):
         from hermes_lcm.escalation import SummarySpendGuard
 

@@ -409,6 +409,17 @@ def _invoke_summary_llm_chain(
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
             return result
+        if result:
+            # The route answered; only the summary was too long for this
+            # source (usually a tiny chunk). Counting it as a route failure
+            # let one small chunk open the circuit and push the next
+            # compactions to L3 truncation (upstream issue #614).
+            logger.info(
+                "LCM summary from %s rejected: not shorter than the source; "
+                "route health unchanged",
+                candidate_model or _DEFAULT_ROUTE_KEY,
+            )
+            continue
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
