@@ -136,6 +136,7 @@ from .message_content import (
 )
 from .sqlite_util import (
     _is_sqlite_locked_error,
+    _sqlite_busy_timeout_ms,
     _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
@@ -1369,10 +1370,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._consecutive_ingest_failures += 1
         self._last_ingest_error = f"{type(error).__name__}: {error}"
         self._last_ingest_error_time = time.time()
-        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]"
+        # The SQLite error name and the store's current busy timeout separate
+        # lock contention (and a timeout left shortened by another path) from
+        # other failures. Both are diagnostics only; no message content or SQL
+        # parameters are logged.
+        sqlite_error = "unknown"
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            name = getattr(current, "sqlite_errorname", None)
+            if name:
+                sqlite_error = str(name)
+                break
+            current = current.__cause__ or current.__context__
+        store_conn = getattr(self._store, "_conn", None)
+        busy_timeout_ms = (
+            _sqlite_busy_timeout_ms(store_conn) if store_conn is not None else "closed"
+        )
+        message = (
+            "LCM ingest failed (%s): %s [sqlite_error=%s, busy_timeout_ms=%s, "
+            "consecutive=%d, total=%d]"
+        )
         args = (
             where,
             error,
+            sqlite_error,
+            busy_timeout_ms,
             self._consecutive_ingest_failures,
             self._ingest_failure_count,
         )
@@ -3463,6 +3487,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
+        # Engine clones share these connections. The short session-end timeout
+        # must not apply to a sibling's foreground write, and two overlapping
+        # session-ends must not interleave their timeout changes. Hold both
+        # store locks until the scope below has restored the timeouts. Never
+        # wait for them: a busy store skips this best-effort flush, which a
+        # 50 ms lock wait would have failed anyway.
+        session_end_locks = tuple(
+            lock
+            for lock in (
+                getattr(self._store, "_write_lock", None),
+                getattr(self._lifecycle, "_lock", None),
+            )
+            if lock is not None
+        )
+        held_session_end_locks = []
+        for lock in session_end_locks:
+            if not lock.acquire(blocking=False):
+                break
+            held_session_end_locks.append(lock)
+        if len(held_session_end_locks) != len(session_end_locks):
+            for lock in reversed(held_session_end_locks):
+                lock.release()
+            logger.warning(
+                "LCM session-end flush skipped because the store is busy; "
+                "final messages may be absent from the plugin-local store until the next ingest"
+            )
+            return
         try:
             with _temporary_sqlite_busy_timeout(
                 [
@@ -3524,6 +3575,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             raise
+        finally:
+            for lock in reversed(held_session_end_locks):
+                lock.release()
 
     def on_session_reset(self) -> None:
         if self._host_fallback_compressor is not None:

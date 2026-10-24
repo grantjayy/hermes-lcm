@@ -10027,6 +10027,37 @@ class TestPerTurnIngest:
         finally:
             eng.shutdown()
 
+    def test_ingest_warning_names_sqlite_error_without_content(self, tmp_path, caplog):
+        """A lock failure names the SQLite error and the store's busy timeout,
+        so operators can tell lock contention apart from other failures, and
+        never logs the message content it failed to persist."""
+        config = LCMConfig(database_path=str(tmp_path / "ingest-warning.db"))
+        eng = LCMEngine(config=config)
+        eng.on_session_start("lock-warning", platform="cli", context_length=200000)
+        secret = "private-content-that-must-not-be-logged"
+        # A short timeout keeps the test fast; the warning must report it.
+        eng._store._conn.execute("PRAGMA busy_timeout=50")
+        locker = sqlite3.connect(str(eng._store.db_path), isolation_level=None)
+        locker.execute("BEGIN IMMEDIATE")
+        try:
+            with caplog.at_level(logging.WARNING):
+                eng.ingest([{"role": "user", "content": secret}])
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+            eng.shutdown()
+
+        failures = [
+            record for record in caplog.records
+            if record.getMessage().startswith("LCM ingest failed")
+        ]
+        assert len(failures) == 1
+        assert failures[0].levelno == logging.WARNING
+        message = failures[0].getMessage()
+        assert "sqlite_error=SQLITE_BUSY" in message
+        assert "busy_timeout_ms=50" in message
+        assert secret not in message
+
 
 class TestEngineCompress:
     def _make_long_conversation(self, n_turns=20):
