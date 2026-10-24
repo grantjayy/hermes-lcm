@@ -46,7 +46,7 @@ SESSION_END_SKIP_LIMIT_S = 0.5
 # Hang guard only, matching the join timeouts used by test_db_bootstrap_fts.py.
 JOIN_GUARD_S = 30.0
 
-WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE", "BEGIN IMMEDIATE")
+WRITE_PREFIXES = ("INSERT", "UPDATE", "DELETE", "REPLACE", "DROP", "ALTER", "BEGIN IMMEDIATE")
 SKIP_WARNING = "session-end flush skipped because the store is busy"
 
 # Holds the writer until stdin closes, or for argv[2] seconds when given.
