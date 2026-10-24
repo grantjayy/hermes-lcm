@@ -668,6 +668,33 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
     ]
 
 
+def test_apply_sets_ingested_at_on_imported_messages(tmp_path: Path):
+    # MessageStore marks the legacy ingested_at backfill done when it opens, so
+    # rows the importer writes afterwards never receive the backfill. Dated
+    # grounding reads ingested_at, so imported rows must carry it themselves.
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        apply=True,
+    )
+    assert result.imported == 2
+    MessageStore(target_db).close()
+
+    conn = sqlite3.connect(target_db)
+    rows = conn.execute("SELECT timestamp, ingested_at FROM messages ORDER BY store_id").fetchall()
+    conn.close()
+    assert len(rows) == 2
+    assert all(ingested_at == timestamp for timestamp, ingested_at in rows), rows
+
+
 def test_apply_backs_up_uri_reserved_target_db_path(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"
