@@ -499,9 +499,11 @@ def _build_l1_prompt(
     The trusted system instructions are the custom checkpoint prompt from
     candidate-compaction-prompt.md (issue #869, 2026-08-15), the template that
     scored zero material errors with GLM 5.2 in the LCM model benchmark (v1;
-    the tri-model-reviewed v4 lost the production A/B 1-4). Only its
-    source-boundary sentence changed: the source now travels in the JSON
-    ``sources`` envelope instead of a ``SOURCE MATERIAL`` fence.
+    the tri-model-reviewed v4 lost the production A/B 1-4). Untrusted values
+    moved out of the text: the source-boundary sentence points at the JSON
+    ``sources`` envelope instead of a ``SOURCE MATERIAL`` fence, and the focus
+    topic and custom instructions are referenced in ``request`` rather than
+    inlined. Every other sentence is the benchmarked wording.
     """
     depth_guidance = {
         0: "Preserve decisions, rationale, constraints, active tasks, file paths, commands, and specific values.",
