@@ -17,9 +17,10 @@ import sqlite3
 import stat
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -54,11 +55,25 @@ from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
-    _temporary_sqlite_busy_timeout,
 )
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
+
+# Compaction telemetry is best-effort diagnostics on the compaction hot path.
+# Upstream bounds its SQLite write wait at 100 ms; the in-process telemetry
+# lock uses the same bound so sibling clones cannot extend it.
+_COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS = 100
+_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S = _COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS / 1000
+
+
+class CompactionTelemetryBusyError(sqlite3.OperationalError):
+    """Another thread held the telemetry connection past the bounded wait.
+
+    Subclasses ``OperationalError`` so callers treat it exactly like SQLite's
+    own "database is locked": the write is skipped, and engine pending
+    counters stay set so a later call records the compaction.
+    """
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -352,6 +367,14 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        # Engine clones share one MessageStore (engine._SharedStorage), so
+        # telemetry on ``self._conn`` would join a sibling's open transaction
+        # and change its connection-wide busy timeout. A dedicated connection
+        # keeps telemetry bounded and isolated, as upstream's one-store-per-
+        # engine design assumed. Its own lock serializes use of that
+        # connection; it never touches ``_write_lock``.
+        self._telemetry_conn: Optional[sqlite3.Connection] = None
+        self._telemetry_lock = threading.Lock()
         self._init_db()
 
     def _init_db(self):
@@ -1136,17 +1159,64 @@ class MessageStore:
     def _compaction_telemetry_key(conversation_id: str) -> str:
         return f"compaction_telemetry:{conversation_id}"
 
+    @contextmanager
+    def _compaction_telemetry_connection(self) -> Iterator[Optional[sqlite3.Connection]]:
+        """Yield the telemetry connection, or None once the store is closed.
+
+        Raises ``CompactionTelemetryBusyError`` when another thread holds the
+        telemetry connection past the bounded wait.
+        """
+        if self._is_memory_database:
+            # A :memory: database is private to one connection, so telemetry
+            # stays on the shared connection under the store write lock.
+            with self._write_lock:
+                yield self._conn
+            return
+        if not self._telemetry_lock.acquire(timeout=_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S):
+            logger.debug("LCM compaction telemetry skipped: telemetry connection busy")
+            raise CompactionTelemetryBusyError("compaction telemetry connection is busy")
+        try:
+            if self._conn is None:
+                yield None
+                return
+            if self._telemetry_conn is None:
+                conn = sqlite3.connect(
+                    str(self.db_path),
+                    timeout=_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S,
+                    check_same_thread=False,
+                )
+                try:
+                    configure_connection(conn)
+                    conn.execute(f"PRAGMA busy_timeout={_COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS}")
+                except BaseException:
+                    conn.close()
+                    raise
+                self._telemetry_conn = conn
+            yield self._telemetry_conn
+        finally:
+            self._telemetry_lock.release()
+
     def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         """Return the persisted per-conversation compaction-telemetry record, or None.
 
-        Best-effort: a closed connection, missing/empty row, or malformed JSON all
-        yield None. Telemetry is diagnostic and must never block a turn. Reads are
-        unlocked, matching the store's other read paths.
+        A closed store, missing/empty row, or malformed JSON yield None. A busy
+        telemetry connection raises ``CompactionTelemetryBusyError`` rather than
+        returning None, so callers never mistake a skipped read for an absent
+        record and overwrite it from an empty baseline.
         """
         if not conversation_id:
             return None
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (self._compaction_telemetry_key(conversation_id),),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
         try:
-            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
+            data = json.loads(str(row[0]))
         except (ValueError, TypeError):
             return None
         return data if isinstance(data, dict) else None
@@ -1162,31 +1232,27 @@ class MessageStore:
             return None
         if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
             raise ValueError("compaction telemetry increment must be a non-negative integer")
-        conn = self._conn
-        if conn is None:
-            return None
-
         key = self._compaction_telemetry_key(conversation_id)
-        with self._write_lock:
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return None
             try:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
-                # read-modify-write serializes across every connection. This is
-                # best-effort telemetry on the completed-compaction hot path, so
-                # permit only a tightly bounded overlap before skipping instead
-                # of inheriting the connection's 30s wait.
-                with _temporary_sqlite_busy_timeout([conn], 100):
-                    conn.execute("BEGIN IMMEDIATE")
-                    row = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?",
-                        (key,),
-                    ).fetchone()
-                    try:
-                        existing = json.loads(str(row[0])) if row and row[0] else {}
-                    except (ValueError, TypeError):
-                        existing = {}
-                    if not isinstance(existing, dict):
-                        existing = {}
+                # read-modify-write serializes across every connection. The
+                # telemetry connection's busy timeout is fixed at 100 ms, so a
+                # contended write skips instead of waiting.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                try:
+                    existing = json.loads(str(row[0])) if row and row[0] else {}
+                except (ValueError, TypeError):
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
 
                 # Per-runtime high-water marks make a committed increment
                 # idempotent when its caller observes an ambiguous exception.
@@ -1281,7 +1347,8 @@ class MessageStore:
         """Upsert the per-conversation compaction-telemetry record.
 
         Stored as a single JSON row in the existing metadata table (no dedicated
-        schema, no version bump) under the store write lock. The write -- and its
+        schema, no version bump) on the telemetry connection, because it writes
+        the same row as ``increment_compaction_telemetry``. The write -- and its
         commit -- is skipped when the serialized payload is unchanged so idle
         turns do not churn the row.
         """
@@ -1289,7 +1356,28 @@ class MessageStore:
             return
         serialized = json.dumps(record, sort_keys=True)
         key = self._compaction_telemetry_key(conversation_id)
-        self.write_metadata_json([key], serialized, skip_unchanged=True)
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return
+            try:
+                existing = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?", (key,)
+                ).fetchone()
+                if existing is not None and existing[0] == serialized:
+                    return
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     # -- Search -------------------------------------------------------------
 
@@ -1751,6 +1839,16 @@ class MessageStore:
                 pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
+        # The main connection is cleared first so a telemetry call that is
+        # waiting for the lock sees a closed store and cannot reopen this one.
+        telemetry_lock = getattr(self, "_telemetry_lock", None)
+        if telemetry_lock is None:
+            return
+        with telemetry_lock:
+            telemetry_conn = self._telemetry_conn
+            self._telemetry_conn = None
+            if telemetry_conn is not None:
+                telemetry_conn.close()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

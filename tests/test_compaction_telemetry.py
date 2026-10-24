@@ -7,6 +7,9 @@ import time
 
 import pytest
 
+from hermes_lcm import command as lcm_command
+from hermes_lcm import db_bootstrap, sqlite_util
+from hermes_lcm import engine as engine_module
 from hermes_lcm import tools as lcm_tools
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
@@ -624,3 +627,280 @@ def test_store_roundtrip_and_skip_unchanged(tmp_path):
     store.write_compaction_telemetry("", {"x": 1})
     assert store.read_compaction_telemetry("") is None
     store.close()
+
+
+def _busy_timeout_ms(conn):
+    return conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+
+def _fts_match_count(db_path, term):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
+            (term,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _shared_storage_pair(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_test.db"))
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    sibling = first.clone_for_agent()
+    assert sibling._store is first._store
+    return config, first, sibling
+
+
+def test_sibling_telemetry_does_not_roll_back_foreground_fts_repair(tmp_path, monkeypatch):
+    config, foreground, sibling = _shared_storage_pair(tmp_path)
+    term = "zanzibarrepairterm"
+    paused_after_drop = threading.Event()
+    telemetry_errors = []
+
+    def record_sibling_telemetry():
+        try:
+            sibling._record_successful_compaction_telemetry()
+        except Exception as exc:
+            telemetry_errors.append(exc)
+
+    real_drop = db_bootstrap._drop_fts_table
+
+    def drop_then_record_sibling_telemetry(conn, table_name):
+        real_drop(conn, table_name)
+        if table_name != "messages_fts" or paused_after_drop.is_set():
+            return
+        paused_after_drop.set()
+        assert conn.in_transaction
+        telemetry_thread = threading.Thread(target=record_sibling_telemetry)
+        telemetry_thread.start()
+        telemetry_thread.join(timeout=10)
+        assert not telemetry_thread.is_alive()
+
+    try:
+        foreground.on_session_start(
+            "foreground-session",
+            platform="cli",
+            conversation_id="conv-foreground",
+        )
+        foreground._ingest_messages([{"role": "user", "content": f"remember {term}"}])
+        sibling.on_session_start("sibling-session", platform="cli", conversation_id="conv-1")
+        sibling.compression_count = 1
+
+        # Clear the index behind the content table so explicit repair must
+        # drop and rebuild messages_fts inside its own write transaction.
+        shared_conn = foreground._store.connection
+        shared_conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')")
+        shared_conn.commit()
+        assert _fts_match_count(config.database_path, term) == 0
+
+        monkeypatch.setattr(db_bootstrap, "_drop_fts_table", drop_then_record_sibling_telemetry)
+        result = lcm_command._doctor_repair_apply_text(foreground)
+
+        assert paused_after_drop.is_set()
+        assert telemetry_errors == []
+        assert "status: ok" in result, result
+        assert _fts_match_count(config.database_path, term) == 1
+
+        # The repair held SQLite's write reservation, so the sibling's count
+        # stayed pending and the next call records it.
+        sibling._record_successful_compaction_telemetry()
+        assert sibling._store.read_compaction_telemetry("conv-1")["total_compactions"] == 1
+    finally:
+        sibling.shutdown()
+        foreground.shutdown()
+
+
+def test_session_end_overlapping_sibling_telemetry_restores_shared_busy_timeout(
+    tmp_path,
+    monkeypatch,
+):
+    _config, ending, sibling = _shared_storage_pair(tmp_path)
+    shared_conn = ending._store.connection
+    original_timeout = _busy_timeout_ms(shared_conn)
+    user_message = {"role": "user", "content": "already ingested before session end"}
+    telemetry_thread_name = "sibling-telemetry"
+    telemetry_progressed = threading.Event()
+    session_end_in_bounded_flush = threading.Event()
+    session_end_finished = threading.Event()
+    telemetry_errors = []
+
+    real_busy_timeout_ms = sqlite_util._sqlite_busy_timeout_ms
+
+    def observe_busy_timeout(conn):
+        value = real_busy_timeout_ms(conn)
+        if threading.current_thread().name == telemetry_thread_name:
+            # Hold telemetry after it saved the shared timeout so session-end
+            # restores first, the interleaving that leaks the 50 ms value.
+            telemetry_progressed.set()
+            session_end_finished.wait(timeout=5)
+        return value
+
+    def record_sibling_telemetry():
+        try:
+            sibling._record_successful_compaction_telemetry()
+        except Exception as exc:
+            telemetry_errors.append(exc)
+        finally:
+            telemetry_progressed.set()
+
+    telemetry_thread = threading.Thread(
+        target=record_sibling_telemetry,
+        name=telemetry_thread_name,
+    )
+    try:
+        ending.on_session_start("ending-session", platform="cli", conversation_id="conv-ending")
+        ending._ingest_messages([user_message])
+        sibling.on_session_start("sibling-session", platform="cli", conversation_id="conv-1")
+        sibling.compression_count = 1
+
+        real_ingest = ending._ingest_messages
+
+        def ingest_inside_bounded_flush(messages):
+            if (
+                not session_end_in_bounded_flush.is_set()
+                and _busy_timeout_ms(shared_conn) == engine_module._SESSION_END_BUSY_TIMEOUT_MS
+            ):
+                session_end_in_bounded_flush.set()
+                telemetry_thread.start()
+                assert telemetry_progressed.wait(timeout=5)
+            return real_ingest(messages)
+
+        monkeypatch.setattr(sqlite_util, "_sqlite_busy_timeout_ms", observe_busy_timeout)
+        monkeypatch.setattr(ending, "_ingest_messages", ingest_inside_bounded_flush)
+        ending.on_session_end("ending-session", [user_message])
+        session_end_finished.set()
+        telemetry_thread.join(timeout=10)
+
+        assert session_end_in_bounded_flush.is_set()
+        assert not telemetry_thread.is_alive()
+        assert telemetry_errors == []
+        assert _busy_timeout_ms(shared_conn) == original_timeout
+        assert sibling._store.read_compaction_telemetry("conv-1")["total_compactions"] == 1
+    finally:
+        session_end_finished.set()
+        if telemetry_thread.is_alive():
+            telemetry_thread.join(timeout=10)
+        sibling.shutdown()
+        ending.shutdown()
+
+
+def test_sibling_ingest_contention_does_not_block_telemetry(tmp_path):
+    config, ingesting, sibling = _shared_storage_pair(tmp_path)
+    shared_conn = ingesting._store.connection
+    ingest_thread_name = "sibling-ingest"
+    insert_started = threading.Event()
+    telemetry_done = threading.Event()
+    errors = []
+
+    def observe_statement(statement):
+        if (
+            threading.current_thread().name == ingest_thread_name
+            and statement.lstrip().upper().startswith("INSERT INTO MESSAGES")
+        ):
+            insert_started.set()
+
+    def ingest():
+        try:
+            ingesting._ingest_messages([{"role": "user", "content": "contended ingest"}])
+        except Exception as exc:
+            errors.append(exc)
+
+    telemetry_elapsed = []
+
+    def record_sibling_telemetry():
+        # Time the call inside its own thread: a telemetry thread blocked on
+        # the shared connection can also stall the observing thread.
+        started = time.monotonic()
+        try:
+            sibling._record_successful_compaction_telemetry()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            telemetry_elapsed.append(time.monotonic() - started)
+            telemetry_done.set()
+
+    ingesting.on_session_start("ingest-session", platform="cli", conversation_id="conv-ingest")
+    sibling.on_session_start("sibling-session", platform="cli", conversation_id="conv-1")
+    sibling.compression_count = 1
+
+    external_writer = sqlite3.connect(config.database_path, check_same_thread=False)
+    ingest_thread = threading.Thread(target=ingest, name=ingest_thread_name)
+    telemetry_thread = threading.Thread(target=record_sibling_telemetry)
+    try:
+        external_writer.execute("BEGIN IMMEDIATE")
+        shared_conn.set_trace_callback(observe_statement)
+        ingest_thread.start()
+        # The sibling's INSERT now waits on SQLite's write lock while it holds
+        # the shared connection and the store write lock.
+        assert insert_started.wait(timeout=5)
+
+        telemetry_thread.start()
+        finished_while_contended = telemetry_done.wait(timeout=1.0)
+        persisted_while_contended = sibling._store.read_compaction_telemetry("conv-1")
+    finally:
+        external_writer.rollback()
+        external_writer.close()
+        ingest_thread.join(timeout=35)
+        telemetry_thread.join(timeout=35)
+        shared_conn.set_trace_callback(None)
+
+    try:
+        assert finished_while_contended
+        assert telemetry_elapsed[0] < 1.0
+        assert persisted_while_contended is None
+        assert not ingest_thread.is_alive()
+        assert not telemetry_thread.is_alive()
+        assert errors == []
+
+        sibling._record_successful_compaction_telemetry()
+        assert sibling._store.read_compaction_telemetry("conv-1")["total_compactions"] == 1
+    finally:
+        sibling.shutdown()
+        ingesting.shutdown()
+
+
+def test_busy_telemetry_connection_skips_and_keeps_pending_counts(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_test.db"))
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    first.on_session_start("first-session", platform="cli", conversation_id="conv-1")
+    first.compression_count = 3
+    first._record_successful_compaction_telemetry()
+    first.on_session_start("next-session", platform="cli", conversation_id="conv-1")
+    first.compression_count = 1
+    assert first._compaction_telemetry_counter_rebaseline_pending is True
+
+    telemetry_lock = first._store._telemetry_lock
+    errors = []
+    elapsed = []
+
+    def record_while_busy():
+        started = time.monotonic()
+        try:
+            first._record_successful_compaction_telemetry()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            elapsed.append(time.monotonic() - started)
+
+    try:
+        assert telemetry_lock.acquire(timeout=5)
+        try:
+            recorder = threading.Thread(target=record_while_busy)
+            recorder.start()
+            recorder.join(timeout=10)
+        finally:
+            telemetry_lock.release()
+
+        assert not recorder.is_alive()
+        assert errors == []
+        assert elapsed[0] < 1.0
+        assert first._store.read_compaction_telemetry("conv-1")["total_compactions"] == 3
+        # A skipped write must not consume the post-rollover rebaseline, or the
+        # next write would treat the new session's first compaction as old.
+        assert first._compaction_telemetry_counter_rebaseline_pending is True
+
+        first._record_successful_compaction_telemetry()
+        assert first._store.read_compaction_telemetry("conv-1")["total_compactions"] == 4
+    finally:
+        first.shutdown()
