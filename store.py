@@ -375,6 +375,12 @@ class MessageStore:
         # connection; it never touches ``_write_lock``.
         self._telemetry_conn: Optional[sqlite3.Connection] = None
         self._telemetry_lock = threading.Lock()
+        # The telemetry connection opens lazily, possibly after the process
+        # changed its working directory. Resolve a relative path now so it
+        # opens the same database file as ``self._conn``.
+        self._telemetry_db_path = (
+            str(self.db_path) if self._is_memory_database else os.path.abspath(self.db_path)
+        )
         self._init_db()
 
     def _init_db(self):
@@ -1181,7 +1187,7 @@ class MessageStore:
                 return
             if self._telemetry_conn is None:
                 conn = sqlite3.connect(
-                    str(self.db_path),
+                    self._telemetry_db_path,
                     timeout=_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S,
                     check_same_thread=False,
                 )

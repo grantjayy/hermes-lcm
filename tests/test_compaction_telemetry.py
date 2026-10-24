@@ -904,3 +904,27 @@ def test_busy_telemetry_connection_skips_and_keeps_pending_counts(tmp_path):
         assert first._store.read_compaction_telemetry("conv-1")["total_compactions"] == 4
     finally:
         first.shutdown()
+
+
+def test_telemetry_connection_opens_original_database_after_cwd_change(tmp_path, monkeypatch):
+    first_dir = tmp_path / "first"
+    other_dir = tmp_path / "other"
+    first_dir.mkdir()
+    other_dir.mkdir()
+    monkeypatch.chdir(first_dir)
+    store = MessageStore("lcm.db")
+    try:
+        # The telemetry connection opens lazily. Move the working directory
+        # before its first use, as /worktree can do during a live session.
+        monkeypatch.chdir(other_dir)
+        store.increment_compaction_telemetry("conv-1", 1, {})
+
+        assert not (other_dir / "lcm.db").exists()
+        row = store._conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (store._compaction_telemetry_key("conv-1"),),
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row[0])["total_compactions"] == 1
+    finally:
+        store.close()
