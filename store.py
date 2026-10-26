@@ -12,12 +12,15 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
+import os
 import sqlite3
+import stat
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -49,9 +52,28 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+)
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
+
+# Compaction telemetry is best-effort diagnostics on the compaction hot path.
+# Upstream bounds its SQLite write wait at 100 ms; the in-process telemetry
+# lock uses the same bound so sibling clones cannot extend it.
+_COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS = 100
+_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S = _COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS / 1000
+
+
+class CompactionTelemetryBusyError(sqlite3.OperationalError):
+    """Another thread held the telemetry connection past the bounded wait.
+
+    Subclasses ``OperationalError`` so callers treat it exactly like SQLite's
+    own "database is locked": the write is skipped, and engine pending
+    counters stay set so a later call records the compaction.
+    """
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -62,6 +84,65 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+
+def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _restrict_created_sqlite_directory(path: Path) -> None:
+    """Restrict a newly created directory without following a replacement."""
+    if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
+        path.chmod(0o700)
+        return
+
+    parent = path.parent
+    expected_parent = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(expected_parent.st_mode):
+        raise OSError(f"database directory parent is not a real directory: {parent}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(parent, flags)
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or not _same_directory_identity(expected_parent, opened_parent)
+        ):
+            raise OSError(f"database directory parent changed during validation: {parent}")
+
+        expected = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"database directory is not a real directory: {path}")
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_directory_identity(expected, opened)
+            ):
+                raise OSError(f"database directory changed during validation: {path}")
+            os.fchmod(fd, 0o700)
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_directory_identity(opened, current):
+                raise OSError(f"database directory changed while restricting permissions: {path}")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _prepare_private_sqlite_storage(db_path: Path) -> None:
+    """Create or tighten one SQLite database path before SQLite opens it."""
+    try:
+        db_path.parent.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        _restrict_created_sqlite_directory(db_path.parent)
+
+    _prepare_private_sqlite_file(db_path)
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -263,7 +344,9 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._is_memory_database = str(self.db_path) == ":memory:"
+        if not self._is_memory_database:
+            _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
@@ -284,12 +367,28 @@ class MessageStore:
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
         self._write_lock = threading.RLock()
+        # Engine clones share one MessageStore (engine._SharedStorage), so
+        # telemetry on ``self._conn`` would join a sibling's open transaction
+        # and change its connection-wide busy timeout. A dedicated connection
+        # keeps telemetry bounded and isolated, as upstream's one-store-per-
+        # engine design assumed. Its own lock serializes use of that
+        # connection; it never touches ``_write_lock``.
+        self._telemetry_conn: Optional[sqlite3.Connection] = None
+        self._telemetry_lock = threading.Lock()
+        # The telemetry connection opens lazily, possibly after the process
+        # changed its working directory. Resolve a relative path now so it
+        # opens the same database file as ``self._conn``.
+        self._telemetry_db_path = (
+            str(self.db_path) if self._is_memory_database else os.path.abspath(self.db_path)
+        )
         self._init_db()
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        if not self._is_memory_database:
+            _restrict_existing_sqlite_artifacts(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1066,26 +1165,196 @@ class MessageStore:
     def _compaction_telemetry_key(conversation_id: str) -> str:
         return f"compaction_telemetry:{conversation_id}"
 
+    @contextmanager
+    def _compaction_telemetry_connection(self) -> Iterator[Optional[sqlite3.Connection]]:
+        """Yield the telemetry connection, or None once the store is closed.
+
+        Raises ``CompactionTelemetryBusyError`` when another thread holds the
+        telemetry connection past the bounded wait.
+        """
+        if self._is_memory_database:
+            # A :memory: database is private to one connection, so telemetry
+            # stays on the shared connection under the store write lock.
+            with self._write_lock:
+                yield self._conn
+            return
+        if not self._telemetry_lock.acquire(timeout=_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S):
+            logger.debug("LCM compaction telemetry skipped: telemetry connection busy")
+            raise CompactionTelemetryBusyError("compaction telemetry connection is busy")
+        try:
+            if self._conn is None:
+                yield None
+                return
+            if self._telemetry_conn is None:
+                conn = sqlite3.connect(
+                    self._telemetry_db_path,
+                    timeout=_COMPACTION_TELEMETRY_LOCK_TIMEOUT_S,
+                    check_same_thread=False,
+                )
+                try:
+                    configure_connection(conn)
+                    conn.execute(f"PRAGMA busy_timeout={_COMPACTION_TELEMETRY_BUSY_TIMEOUT_MS}")
+                except BaseException:
+                    conn.close()
+                    raise
+                self._telemetry_conn = conn
+            yield self._telemetry_conn
+        finally:
+            self._telemetry_lock.release()
+
     def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         """Return the persisted per-conversation compaction-telemetry record, or None.
 
-        Best-effort: a closed connection, missing/empty row, or malformed JSON all
-        yield None. Telemetry is diagnostic and must never block a turn. Reads are
-        unlocked, matching the store's other read paths.
+        A closed store, missing/empty row, or malformed JSON yield None. A busy
+        telemetry connection raises ``CompactionTelemetryBusyError`` rather than
+        returning None, so callers never mistake a skipped read for an absent
+        record and overwrite it from an empty baseline.
         """
         if not conversation_id:
             return None
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (self._compaction_telemetry_key(conversation_id),),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
         try:
-            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
+            data = json.loads(str(row[0]))
         except (ValueError, TypeError):
             return None
         return data if isinstance(data, dict) else None
+
+    def increment_compaction_telemetry(
+        self,
+        conversation_id: str,
+        increment: int,
+        updates: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically increment and update one conversation's telemetry record."""
+        if not conversation_id:
+            return None
+        if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
+            raise ValueError("compaction telemetry increment must be a non-negative integer")
+        key = self._compaction_telemetry_key(conversation_id)
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return None
+            try:
+                # Separate MessageStore instances have separate Python locks.
+                # Acquire SQLite's write reservation before reading so this
+                # read-modify-write serializes across every connection. The
+                # telemetry connection's busy timeout is fixed at 100 ms, so a
+                # contended write skips instead of waiting.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                try:
+                    existing = json.loads(str(row[0])) if row and row[0] else {}
+                except (ValueError, TypeError):
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
+
+                # Per-runtime high-water marks make a committed increment
+                # idempotent when its caller observes an ambiguous exception.
+                # Retain enough recent epochs for overlapping runtimes without
+                # allowing this diagnostic metadata row to grow forever.
+                watermarks = []
+                raw_watermarks = existing.get("counter_epoch_watermarks", [])
+                if isinstance(raw_watermarks, list):
+                    watermarks = [
+                        item
+                        for item in raw_watermarks
+                        if (
+                            isinstance(item, list)
+                            and len(item) == 2
+                            and isinstance(item[0], str)
+                            and item[0]
+                            and isinstance(item[1], int)
+                            and not isinstance(item[1], bool)
+                            and item[1] >= 0
+                        )
+                    ]
+                effective_increment = increment
+                counter_epoch = updates.get("counter_epoch")
+                target_count = updates.get("compression_count_at_record")
+                if (
+                    isinstance(counter_epoch, str)
+                    and counter_epoch
+                    and isinstance(target_count, int)
+                    and not isinstance(target_count, bool)
+                    and target_count >= 0
+                ):
+                    prior_count = next(
+                        (item[1] for item in watermarks if item[0] == counter_epoch),
+                        0,
+                    )
+                    effective_increment = max(0, target_count - prior_count)
+                    watermarks = [item for item in watermarks if item[0] != counter_epoch]
+                    watermarks.append([counter_epoch, max(prior_count, target_count)])
+                    watermarks = watermarks[-64:]
+
+                current_total = existing.get("total_compactions", 0)
+                if (
+                    isinstance(current_total, bool)
+                    or not isinstance(current_total, int)
+                    or current_total < 0
+                ):
+                    current_total = 0
+                proposed_total = updates.get("total_compactions", current_total)
+                if (
+                    isinstance(proposed_total, bool)
+                    or not isinstance(proposed_total, int)
+                    or proposed_total < 0
+                ):
+                    proposed_total = current_total
+                stale_across_compaction = (
+                    effective_increment == 0 and proposed_total < current_total
+                )
+                record = dict(existing)
+                if stale_across_compaction:
+                    compaction_sensitive = {
+                        "turns_since_leaf_compaction",
+                        "peak_prompt_tokens_since_leaf_compaction",
+                        "last_leaf_compaction_at",
+                        "last_compaction_duration_ms",
+                    }
+                    record.update(
+                        (field, value)
+                        for field, value in updates.items()
+                        if field not in compaction_sensitive
+                    )
+                else:
+                    record.update(updates)
+                record["conversation_id"] = conversation_id
+                record["counter_epoch_watermarks"] = watermarks
+                record["total_compactions"] = current_total + effective_increment
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, json.dumps(record, sort_keys=True)),
+                )
+                conn.commit()
+                return record
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
         """Upsert the per-conversation compaction-telemetry record.
 
         Stored as a single JSON row in the existing metadata table (no dedicated
-        schema, no version bump) under the store write lock. The write -- and its
+        schema, no version bump) on the telemetry connection, because it writes
+        the same row as ``increment_compaction_telemetry``. The write -- and its
         commit -- is skipped when the serialized payload is unchanged so idle
         turns do not churn the row.
         """
@@ -1093,7 +1362,28 @@ class MessageStore:
             return
         serialized = json.dumps(record, sort_keys=True)
         key = self._compaction_telemetry_key(conversation_id)
-        self.write_metadata_json([key], serialized, skip_unchanged=True)
+        with self._compaction_telemetry_connection() as conn:
+            if conn is None:
+                return
+            try:
+                existing = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?", (key,)
+                ).fetchone()
+                if existing is not None and existing[0] == serialized:
+                    return
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     # -- Search -------------------------------------------------------------
 
@@ -1555,6 +1845,16 @@ class MessageStore:
                 pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
+        # The main connection is cleared first so a telemetry call that is
+        # waiting for the lock sees a closed store and cannot reopen this one.
+        telemetry_lock = getattr(self, "_telemetry_lock", None)
+        if telemetry_lock is None:
+            return
+        with telemetry_lock:
+            telemetry_conn = self._telemetry_conn
+            self._telemetry_conn = None
+            if telemetry_conn is not None:
+                telemetry_conn.close()
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
