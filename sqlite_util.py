@@ -226,13 +226,16 @@ def _temporary_sqlite_busy_timeout(
     """Temporarily bound SQLite lock waits for gateway-critical paths."""
     bounded_timeout = max(0, int(timeout_ms))
     originals: list[tuple[sqlite3.Connection, int]] = []
-    for conn in connections:
-        if conn is None:
-            continue
-        original = _sqlite_busy_timeout_ms(conn)
-        conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
-        originals.append((conn, original))
+    # Setup sits inside the try so a failure on a later connection still
+    # restores the earlier ones; otherwise they keep the short timeout and
+    # every later foreground write on them fails after a few milliseconds.
     try:
+        for conn in connections:
+            if conn is None:
+                continue
+            original = _sqlite_busy_timeout_ms(conn)
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
+            originals.append((conn, original))
         yield
     finally:
         for conn, original in reversed(originals):

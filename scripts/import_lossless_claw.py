@@ -1042,10 +1042,13 @@ def _insert_import_candidate(
     )
     tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
     cur = conn.execute(
+        # ingested_at copies timestamp, as the legacy backfill did. The store
+        # runs that backfill once and marks it done when it opens, before these
+        # rows exist, so imported rows must set it here or keep NULL forever.
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls,
-            tool_name, timestamp, token_estimate, pinned)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            tool_name, timestamp, token_estimate, pinned, ingested_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
         (
             candidate.target_session_id,
             _normalize_source_value(candidate.source),
@@ -1056,6 +1059,7 @@ def _insert_import_candidate(
             protected_msg.get("tool_name"),
             candidate.timestamp,
             count_message_tokens(protected_msg),
+            candidate.timestamp,
         ),
     )
     store_id = int(cur.lastrowid)

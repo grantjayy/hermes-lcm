@@ -2287,6 +2287,15 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(findings))
 
 
+def is_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> bool:
+    """True once ``mark_migration_step_complete(step_name)`` has run on this DB."""
+    ensure_migration_state_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ? LIMIT 1", (step_name,)
+    ).fetchone()
+    return row is not None
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
@@ -2579,7 +2588,14 @@ def _record_integrity_failed(
 
 def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     ensure_metadata_table(conn)
-    conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
+    key = _integrity_failed_key(spec)
+    # Every healthy startup reaches this through repair_external_content_fts.
+    # A DELETE takes the database writer even when it matches nothing, so it
+    # could wait the full busy timeout behind another process during plugin
+    # load. Check with a read first and write only when a flag exists.
+    if conn.execute("SELECT 1 FROM metadata WHERE key = ?", (key,)).fetchone() is None:
+        return
+    conn.execute("DELETE FROM metadata WHERE key = ?", (key,))
 
 
 def load_integrity_failed(
@@ -2657,10 +2673,14 @@ def _run_background_integrity_scan(
 ) -> None:
     """Daemon-thread body: deep-check ``spec`` on a private connection.
 
-    Opens its own read/write connection for the scan (the FTS5 integrity-check is
-    issued as an INSERT command that rolls back inside a savepoint, so it never
-    mutates data, but it does require a writable handle) and a separate brief
-    connection to stamp the result. On corruption it flags rather than rebuilds.
+    Opens its own read/write connection (the FTS5 integrity-check is issued as an
+    INSERT command that rolls back inside a savepoint, so it never mutates data,
+    but it does require a writable handle). The check and its result share one
+    ``BEGIN IMMEDIATE`` transaction: the scan already holds the writer, so
+    publishing the result cannot meet a lock. A result written on a second
+    connection after the scan could be lost to a lock, leaving the checked
+    marker old so every later process re-ran the scan after the stale window.
+    On corruption it flags rather than rebuilds.
     """
     key = (db_path, spec.table_name)
     timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
@@ -2668,24 +2688,16 @@ def _run_background_integrity_scan(
         scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            # Persist the scan-started stamp on this DB so a crash mid-scan is
-            # detectable cross-process via the staleness window above.
+            scan_conn.execute("BEGIN IMMEDIATE")
             _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
             result = check_external_content_fts_integrity(scan_conn, spec)
-        finally:
-            scan_conn.close()
-
-        meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
             if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
+                _record_integrity_checked(scan_conn, spec, now=started_at)
+                _clear_integrity_failed(scan_conn, spec)
             elif status == "fail":
                 _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    scan_conn, spec, detail=result.get("detail", ""), now=started_at
                 )
                 logger.warning(
                     "Background FTS integrity-check found corruption in '%s': %s. "
@@ -2695,10 +2707,13 @@ def _run_background_integrity_scan(
                 )
             # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
             # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
+            _clear_scan_started(scan_conn, spec, expected=started_at)
+            scan_conn.commit()
+        except BaseException:
+            scan_conn.rollback()
+            raise
         finally:
-            meta_conn.close()
+            scan_conn.close()
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "Background FTS integrity-check for '%s' failed", spec.table_name
@@ -2743,27 +2758,30 @@ def _dispatch_background_integrity_scan(
             # A recent scan (this or another process) owns this table; let it
             # stamp the marker. The bind returns fast without a duplicate scan.
             return True
-        # Durably claim the scan cross-process BEFORE starting the thread. The
-        # spawned thread stamps ``scan_started_at`` on its own connection, but
-        # ``thread.start()`` returns before that stamp is committed — a second
-        # process racing ``ensure_external_content_fts`` in that window would read
-        # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
-        # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
-        # just falls back to the thread's own stamp).
-        claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+        # Durably claim the scan cross-process BEFORE starting the thread, so a
+        # second process racing ``ensure_external_content_fts`` sees the stamp
+        # and does not dispatch a duplicate deep scan (F6). This runs on the
+        # plugin-load path, so the claim never waits: if another process holds
+        # the writer, skip this process's scan and let a later start claim it.
+        # The 24-hour interval makes one skipped scan harmless, while a 30 s
+        # busy wait here helped push plugin load past Hermes's 120 s limit.
         try:
-            claim_conn = sqlite3.connect(
-                db_path, timeout=claim_timeout, check_same_thread=False
-            )
+            claim_conn = sqlite3.connect(db_path, timeout=0, check_same_thread=False)
             try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                claim_conn.execute("PRAGMA busy_timeout=0")
                 claim_conn.execute("BEGIN IMMEDIATE")
                 _record_scan_started(claim_conn, spec, now=current)
                 claim_conn.commit()
             finally:
                 claim_conn.close()
-        except sqlite3.DatabaseError:
-            pass
+        except sqlite3.DatabaseError as exc:
+            logger.debug(
+                "Background FTS integrity-check claim for '%s' skipped; a later "
+                "start will claim it: %s",
+                spec.table_name,
+                getattr(exc, "sqlite_errorname", type(exc).__name__),
+            )
+            return True
 
         thread = threading.Thread(
             target=_run_background_integrity_scan,
@@ -3105,6 +3123,7 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
 
     refuse_schema_version_too_new(conn)
     current_version = get_schema_version(conn)
+    stored_version = current_version
     if current_version < 2:
         mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
         current_version = 2
@@ -3135,4 +3154,7 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     # feature materialized lazily by VectorStore (recorded via the named
     # ``embeddings_v1`` marker), so a disabled install stays at v5 with no
     # embedding tables and the numeric counter is free for the temporal train.
-    set_schema_version(conn, current_version)
+    # Re-stamping an unchanged version would take the database writer on every
+    # healthy open, which can wait the full busy timeout during plugin load.
+    if current_version != stored_version:
+        set_schema_version(conn, current_version)
