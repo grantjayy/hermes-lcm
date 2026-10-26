@@ -1,5 +1,5 @@
 name: hermes-lcm
-version: 0.21.0-rc2
+version: 1.0.0-rc.1
 description: "Lossless Context Management — standalone Hermes plugin with a DAG-based context engine that never loses a message"
 author: "Voltropy / Hermes Community"
 provides_tools:
@@ -18,3 +18,10 @@ provides_tools:
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+
+# Context-engine schemas are surfaced via register_context_engine on message-blind hosts.
+# PluginContext.register_tool is conditional to avoid shadowing message-aware dispatch.
+provides_hooks:
+  - pre_llm_call
+  - subagent_start
+  - subagent_stop

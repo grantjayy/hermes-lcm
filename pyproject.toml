@@ -1,0 +1,36 @@
+# Tooling configuration for the hermes-lcm plugin.
+#
+# This file pins lint settings so `ruff` behaves identically locally and in
+# CI. It intentionally declares no [build-system]: the plugin is installed via
+# scripts/install.sh, not pip.
+#
+# The minimal [project] table below is required because the Hermes package
+# manager treats every enabled plugin that ships a pyproject.toml as a uv
+# workspace member. uv rejects a [project] table without `version`, so the
+# whole `uv lock` fails and the plugin gets dropped from the environment.
+# Without a build backend the member is metadata-only (virtual): Hermes
+# rewrites `name` to a per-profile key, and `version` is a placeholder that
+# never has to track plugin.yaml.
+
+[project]
+name = "hermes-lcm"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+# Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
+target-version = "py311"
+
+[tool.ruff.lint]
+# Ruff's default rule set: pyflakes (F) plus a focused pycodestyle subset
+# (E4/E7/E9). We deliberately do not enable line-length (E501) or import
+# sorting (I) -- the codebase predates both and enforcing either would be a
+# large, purely cosmetic reformat with no behavioural benefit.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    # module-import-not-at-top-of-file: several modules import after a
+    # sys.path / optional-dependency bootstrap, so imports legitimately
+    # follow executable statements.
+    "E402",
+]
