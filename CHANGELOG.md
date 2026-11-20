@@ -4,6 +4,13 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Added
+
+- LCM tool calls that take 3 seconds or more log two INFO records:
+  `LCM slow tool call running` (the calling thread's stack and other plugin
+  threads at the 3-second mark) and `LCM slow tool call done` (total, ingest
+  and handler time). Neither holds tool arguments or message text.
+
 ### Fixed
 
 - Broad newest-first message searches no longer time out on large stores.
