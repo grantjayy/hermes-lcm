@@ -6,6 +6,9 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Broad newest-first message searches no longer time out on large stores.
+  `MessageStore.search` now picks the result row ids first and computes rank,
+  snippet and columns only for those rows; results are unchanged.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
 - Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 - SQLite artifact hardening no longer opens a descriptor on an existing

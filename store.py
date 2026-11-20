@@ -264,6 +264,41 @@ def _build_search_order_by(
     return ", ".join(order_parts)
 
 
+def _build_message_search_sql(where: List[str], order_by: str) -> str:
+    """Return the two-stage FTS statement for ``MessageStore.search``.
+
+    Arguments: the WHERE arguments, the fetch limit, the offset, then the MATCH
+    value again. Stage one picks only the row ids, so ``snippet()`` and the full
+    ``content`` load run for the kept rows instead of every match. A one-stage
+    newest-first sort computes them for every match, because FTS5 yields
+    matches oldest first and each one beats the rows kept so far.
+
+    Stage two scans the match set once and keeps the chosen ids. The unary
+    ``+`` on ``fts.rowid`` and the ``CROSS JOIN`` force that plan: without them
+    SQLite looks up each id with its own MATCH, which measured 2 to 30 times
+    slower than the one-stage statement for phrase, multi-word and filtered
+    queries. The outer ORDER BY stays because the paging loop in ``search``
+    reads the last fetched row as the worst fetched row.
+    """
+    where_sql = " AND ".join(where)
+    return f"""WITH top(rid) AS (
+                   SELECT fts.rowid
+                   FROM messages_fts fts
+                   JOIN messages m ON m.store_id = fts.rowid
+                   WHERE {where_sql}
+                   ORDER BY {order_by} LIMIT ? OFFSET ?
+               )
+               SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
+                      m.ingested_at, m.observed_at, m.observed_at_source,
+                      rank as search_rank,
+                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+               FROM messages_fts fts
+               CROSS JOIN messages m ON m.store_id = fts.rowid
+               WHERE messages_fts MATCH ? AND +fts.rowid IN (SELECT rid FROM top)
+               ORDER BY {order_by}"""
+
+
 def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
     normalized = normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
@@ -1475,17 +1510,9 @@ class MessageStore:
                 if time_to is not None:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
-                args.extend([fetch_limit, offset])
+                args.extend([fetch_limit, offset, safe_query])
                 rows = self._conn.execute(
-                    f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
-                              rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                       FROM messages_fts fts
-                       JOIN messages m ON m.store_id = fts.rowid
-                       WHERE {' AND '.join(where)}
-                       ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                    _build_message_search_sql(where, order_by),
                     args,
                 ).fetchall()
                 scanned_rows += len(rows)
