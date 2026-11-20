@@ -125,7 +125,15 @@ def test_post_compaction_replay_reconcile_is_linear(tmp_path, monkeypatch, tail)
     # Each incoming message once + the stored tail and stored head probes
     # (both capped at tail_limit = max(4*len(messages), 64)).
     tail_limit = min(max(len(messages) * 4, 64), len(stored))
-    budget = len(messages) + 2 * tail_limit + 8
+    # The multiset fallback reads every stored row of the session once, and
+    # computes an identity only for a stored row that carries no provider id.
+    stored_rows_without_provider_id = sum(
+        1
+        for row in stored
+        if not (row["role"] == "tool" and row.get("tool_call_id"))
+        and not (row["role"] == "assistant" and row.get("tool_calls"))
+    )
+    budget = len(messages) + 2 * tail_limit + 8 + stored_rows_without_provider_id
     assert identity_calls <= budget, (
         f"{identity_calls} identity computations for {len(messages)} rows (budget {budget})"
     )

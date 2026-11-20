@@ -23,7 +23,26 @@ SESSION_ID = "reingest-duplication-session"
 
 
 def _fixture() -> dict:
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    """The fixture, with a host timestamp on every user message and every assistant text.
+
+    A new engine on a stored session gets the transcript that Hermes loaded
+    from its session database, where each message carries its stored
+    timestamp, and a replayed copy carries the same timestamp. The fixture file
+    holds no timestamps, so they are added here, one for each role and text.
+    The stored "ok " and the replayed "ok" are the same message.
+    """
+    data = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    timestamps: dict[tuple[str, str], float] = {}
+    for part in ("stored", "stored_duplicate", "replay"):
+        for message in data[part]:
+            if message["role"] == "user" or (message["role"] == "assistant" and not message.get("tool_calls")):
+                key = (message["role"], message["content"].strip())
+                message["timestamp"] = timestamps.setdefault(key, 1_795_000_000.0 + 60.0 * len(timestamps))
+    return data
+
+
+def _without_timestamps(messages: list[dict]) -> list[dict]:
+    return [{key: value for key, value in message.items() if key != "timestamp"} for message in _copy(messages)]
 
 
 def _copy(messages: list[dict]) -> list[dict]:
@@ -309,5 +328,56 @@ def test_scaffold_prefix_replay_plus_new_messages_persists_only_new(tmp_path):
         assert engine._store.get_session_count(SESSION_ID) == seeded + 2
         assert _contents(engine)[-2:] == ["scaffold new question", "scaffold new answer"]
         assert not any("Recent Summary" in (c or "") for c in _contents(engine))
+    finally:
+        _close(engine)
+
+
+# -- i. the earlier partial replay sits inside the history --------------------
+
+
+def test_earlier_replay_inside_the_history_persists_nothing(tmp_path):
+    """A replay is written when it happens, so later rows of the conversation follow it."""
+    data = _fixture()
+    earlier_replay_after_rows = 11  # the earlier replay covers the rows up to "beta ok, gamma failed"
+    stored = (
+        _copy(data["stored"][:earlier_replay_after_rows])
+        + _copy(data["stored_duplicate"])
+        + _copy(data["stored"][earlier_replay_after_rows:])
+    )
+    seeded = _seed(tmp_path, stored)
+
+    engine = _replay_engine(tmp_path)
+    try:
+        engine._ingest_messages(_copy(data["replay"]))
+
+        assert _reconciliation(engine)["persisted"] == 0
+        assert engine._store.get_session_count(SESSION_ID) == seeded
+    finally:
+        _close(engine)
+
+
+# -- j. a host that does not stamp user messages -----------------------------
+
+
+def test_replay_without_host_timestamps_loses_nothing_and_repeats_no_provider_row(tmp_path):
+    """Without a timestamp, text that no stored neighbor proves is stored again.
+
+    That is the price of never dropping a message that only looks like a copy.
+    Rows with a provider id are still stored once, and nothing is lost.
+    """
+    data = _fixture()
+    stored = _without_timestamps(data["stored"] + data["stored_duplicate"])
+    replay = _without_timestamps(data["replay"]) + [{"role": "user", "content": "ok"}]
+    seeded = _seed(tmp_path, stored)
+
+    engine = _replay_engine(tmp_path)
+    try:
+        engine._ingest_messages(_copy(replay))
+
+        added = _rows(engine)[seeded:]
+        assert all(row["role"] != "tool" and not row.get("tool_calls") for row in added)
+        assert [c.strip() for c in _contents(engine, role="user")].count("ok") >= 2
+        stored_contents = {(row["role"], (row["content"] or "").strip()) for row in _rows(engine)}
+        assert all((m["role"], (m.get("content") or "").strip()) in stored_contents for m in replay)
     finally:
         _close(engine)

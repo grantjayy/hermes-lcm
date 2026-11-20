@@ -692,6 +692,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # gateway restart reconcile it against the durable store on the
         # next ingest.
         self._ingest_cursor: int = 0
+        # Replay identities of the list that the cursor was last set to the end
+        # of when this engine handed that list back to the host. See
+        # _set_ingest_cursor_to_returned_list.
+        self._ingest_cursor_list_identities: Optional[list[tuple[Any, ...]]] = None
         self._ingest_cursor_needs_reconcile = False
         # When multiset reconciliation runs, it returns cursor=0 (there is no
         # contiguous prefix to advance) and records the exact incoming indexes
@@ -3766,7 +3770,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    # The host also calls this hook at a compaction commit with
+                    # the list from BEFORE the compaction, and then continues
+                    # the conversation with the compacted list. The flush stores
+                    # what is missing, but the ingest position must keep
+                    # describing the list that the host continues with.
+                    cursor_before_flush = self._ingest_cursor
+                    needs_reconcile_before_flush = self._ingest_cursor_needs_reconcile
+                    returned_list_before_flush = getattr(self, "_ingest_cursor_list_identities", None)
+                    self._ingest_cursor_list_identities = None
+                    try:
+                        self._ingest_messages(messages)
+                    finally:
+                        self._ingest_cursor = cursor_before_flush
+                        self._ingest_cursor_needs_reconcile = needs_reconcile_before_flush
+                        self._ingest_cursor_list_identities = returned_list_before_flush
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -4404,6 +4422,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: message ingestion ---------------------------------------
 
+    def _set_ingest_cursor_to_returned_list(self, messages: List[Dict[str, Any]]) -> None:
+        """Point the ingest cursor at the end of a list that goes back to the host.
+
+        The cursor is only a length. The host can change the returned list
+        before it continues with it (it removes a finished todo snapshot, for
+        example), and a cursor past the end of the shorter list hides the next
+        new message. So the identities of the returned rows are kept, and the
+        next ingest trusts the cursor only as far as the rows still match.
+        """
+        self._ingest_cursor = len(messages)
+        self._ingest_cursor_list_identities = [
+            self._message_replay_identity(message) for message in messages
+        ]
+
+    def _verify_ingest_cursor_against_returned_list(
+        self,
+        messages: List[Dict[str, Any]],
+        persisted_prefix_len: Optional[int],
+    ) -> None:
+        """Lower the cursor to the rows that still match the list it was set for.
+
+        When the host changed the returned list, the cursor proves nothing past
+        the first changed row. The stored rows of the session then decide what
+        is new, as they do after a compaction notice. A session without stored
+        rows (a new session id after the compaction) has nothing to compare
+        with, so the rows after the verified prefix are stored.
+        """
+        returned_identities = getattr(self, "_ingest_cursor_list_identities", None)
+        self._ingest_cursor_list_identities = None
+        if (
+            returned_identities is None
+            or self._ingest_cursor_needs_reconcile
+            or len(returned_identities) != self._ingest_cursor
+        ):
+            return
+        if persisted_prefix_len is not None and persisted_prefix_len > self._ingest_cursor:
+            # The host handed back the list that the last ingest processed to
+            # its end. That proof moves the cursor forward by itself.
+            return
+        verified = 0
+        limit = min(len(returned_identities), len(messages))
+        while (
+            verified < limit
+            and self._message_replay_identity(messages[verified]) == returned_identities[verified]
+        ):
+            verified += 1
+        if verified < len(returned_identities):
+            logger.info(
+                "LCM ingest cursor lowered to the verified prefix of the returned list: "
+                "session=%s cursor=%d -> %d incoming=%d",
+                self._session_id,
+                self._ingest_cursor,
+                verified,
+                len(messages),
+            )
+            self._ingest_cursor = verified
+            self._schedule_ingest_cursor_reconciliation()
+
     def _schedule_ingest_cursor_reconciliation(self) -> None:
         """Mark existing-session rebinds for cursor repair on next ingest."""
         self._ingest_cursor_needs_reconcile = False
@@ -4820,6 +4896,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         n = len(messages)
         persisted_prefix_len = self._persisted_prefix_len(messages)
+        self._verify_ingest_cursor_against_returned_list(messages, persisted_prefix_len)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
@@ -6545,7 +6622,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if compressed != original_messages or ingest_cleanup_changed_active_context:
             self._last_compression_status = "overflow_recovery"
             self._last_compression_noop_reason = ""
-            self._ingest_cursor = len(compressed)
+            self._set_ingest_cursor_to_returned_list(compressed)
             self._ingest_cursor_needs_reconcile = False
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",

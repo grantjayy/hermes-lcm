@@ -465,7 +465,7 @@ class CompactionMixin:
                 sanitized_messages,
                 observed_tokens=observed_prompt_tokens,
             )
-            self._ingest_cursor = len(sanitized_messages)
+            self._set_ingest_cursor_to_returned_list(sanitized_messages)
             self._last_compression_status = "sanitized"
             self._last_compression_noop_reason = ""
             self._write_generated_ignored_placeholder_hash_counts(
@@ -916,7 +916,7 @@ class CompactionMixin:
                 # or reassembled context, keeping the old cursor could make the
                 # next appended messages look already ingested. This applies to
                 # content-only cleanup as well as dropped-message cleanup.
-                self._ingest_cursor = len(sanitized_messages)
+                self._set_ingest_cursor_to_returned_list(sanitized_messages)
                 self._last_compression_status = "sanitized"
                 self._last_compression_noop_reason = ""
             else:
@@ -924,7 +924,7 @@ class CompactionMixin:
                     # The active context changed even though no new leaf node was
                     # written. Keep the cursor aligned with the returned context
                     # so the next appended turn is ingested instead of skipped.
-                    self._ingest_cursor = len(sanitized_messages)
+                    self._set_ingest_cursor_to_returned_list(sanitized_messages)
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
@@ -1007,7 +1007,7 @@ class CompactionMixin:
                 )
         # Reset cursor to the length of the compressed context so that
         # only messages appended *after* this point get ingested next time.
-        self._ingest_cursor = len(compressed)
+        self._set_ingest_cursor_to_returned_list(compressed)
         self._ingest_cursor_needs_reconcile = False
 
         logger.info(

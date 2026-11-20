@@ -46,6 +46,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
+from .store import _normalize_observed_at
 
 import logging
 
@@ -911,6 +912,63 @@ class ReconcileMixin:
                     break
         return tuple(sorted(set(ids)))
 
+    @staticmethod
+    def _tool_call_ids_from_calls(tool_calls: Any) -> tuple[str, ...]:
+        """Provider ids of already-decoded tool calls, without canonicalizing them."""
+        if isinstance(tool_calls, dict):
+            tool_calls = [tool_calls]
+        if not isinstance(tool_calls, list):
+            return ()
+        ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            for key in ("id", "call_id", "tool_call_id"):
+                value = call.get(key)
+                if isinstance(value, str) and value:
+                    ids.append(value)
+                    break
+        return tuple(sorted(set(ids)))
+
+    @staticmethod
+    def _tool_call_signature_from_identity(tool_calls_identity: str) -> tuple[tuple[str, str], ...]:
+        """(provider id, digest of the function name and arguments) of each call in a canonical ``tool_calls`` identity.
+
+        A provider can use an id again for a later call, so two tool-call turns
+        are the same call only when the name and the arguments also match.
+        Other fields of a call are not part of it.
+        """
+        if not tool_calls_identity:
+            return ()
+        try:
+            parsed = json.loads(tool_calls_identity)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return ()
+        signature: list[tuple[str, str]] = []
+        for call in parsed:
+            if not isinstance(call, dict):
+                continue
+            call_id = ""
+            for key in ("id", "call_id", "tool_call_id"):
+                value = call.get(key)
+                if isinstance(value, str) and value:
+                    call_id = value
+                    break
+            function = call.get("function")
+            if not isinstance(function, dict):
+                function = {}
+            arguments = function.get("arguments", call.get("arguments"))
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            name = str(function.get("name") or call.get("name") or "")
+            digest = hashlib.sha256(f"{name}\x1f{arguments}".encode("utf-8", "replace")).hexdigest()
+            signature.append((call_id, digest))
+        return tuple(sorted(signature))
+
     def _incoming_has_duplicate_provider_ids(self, messages: List[Dict[str, Any]]) -> bool:
         """True when the batch repeats a tool id or assistant call id.
 
@@ -961,53 +1019,107 @@ class ReconcileMixin:
             digest.update(tool_calls_identity.encode("utf-8", "surrogatepass"))
         return ("text", digest.hexdigest())
 
+    @staticmethod
+    def _tool_call_aliases_from_identity(tool_calls_identity: str) -> frozenset[str]:
+        """Every id spelling of every call in a canonical ``tool_calls`` identity.
+
+        A call can carry more than one id (``id`` and ``call_id``), and its tool
+        result can answer any of them.
+        """
+        if not tool_calls_identity:
+            return frozenset()
+        try:
+            parsed = json.loads(tool_calls_identity)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return frozenset()
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return frozenset()
+        aliases: set[str] = set()
+        for call in parsed:
+            if not isinstance(call, dict):
+                continue
+            for key in ("id", "call_id", "tool_call_id"):
+                value = call.get(key)
+                if isinstance(value, str) and value:
+                    aliases.add(value)
+        return frozenset(aliases)
+
+    @staticmethod
+    def _replay_content_digest(content: str) -> str:
+        return hashlib.sha256((content or "").encode("utf-8", "surrogatepass")).hexdigest()
+
     def _multiset_persisted_indices(
         self,
         messages: List[Dict[str, Any]],
     ) -> tuple[list[int], int, int]:
-        """Incoming indexes whose replay identity is not already stored.
+        """Incoming indexes that the store does not prove it already holds.
 
         Returns ``(new_indices, stored_rows_scanned, already_stored)``.
 
-        Matching is a multiset difference over the normalised replay identity,
-        so legitimate repeats survive (two real "ok" turns are stored twice)
-        while a replayed transcript is not written again.  Rows that carry
-        provider ids are unique: an incoming tool result or assistant
-        tool-call turn whose id is already stored for this session is never
-        inserted again, however often the replay repeats it.  Parallel tool
-        results therefore match by ``tool_call_id`` in any order, and gateway
-        notification turns match by content wherever they sit in the list.
-        """
-        stored_text_counts: dict[tuple[str, str], int] = {}
-        stored_tool_ids: set[str] = set()
-        stored_call_ids: set[str] = set()
-        stored_rows = 0
-        for row in self._store.iter_session_message_identities(self._session_id):
-            stored_rows += 1
-            role = str(row.get("role") or "unknown")
-            tool_call_id = str(row.get("tool_call_id") or "")
-            if role == "tool" and tool_call_id:
-                # Tool results are unique by provider id; content may differ
-                # legitimately (an externalized stored payload vs. the live
-                # text), so the id is the whole identity.
-                stored_tool_ids.add(tool_call_id)
-                continue
-            tool_calls_identity = self._stable_tool_calls_identity(row.get("tool_calls"))
-            call_ids = self._tool_call_ids_from_identity(tool_calls_identity)
-            if role == "assistant" and call_ids:
-                stored_call_ids.update(call_ids)
-                continue
-            _role, content, _tool_call_id, identity_tool_calls = self._message_replay_identity(
-                row, stored_row=True
-            )
-            key = self._multiset_text_identity(role, content or "", identity_tool_calls)
-            stored_text_counts[key] = stored_text_counts.get(key, 0) + 1
+        A row is a copy only when the store proves it. Every other row is new,
+        so a doubt ends in a stored row and never in a dropped one. A message
+        that says the same thing again (a second "Approved") has the same text
+        as the first one, so text alone is never proof. A tool that runs again
+        can have the same provider id, name and arguments as its first run, so
+        a tool call alone is never proof at the end of the list.
 
-        new_indices: list[int] = []
-        already_stored = 0
-        incoming_text_counts: dict[tuple[str, str], int] = {}
-        seen_tool_ids: set[str] = set()
-        seen_call_ids: set[str] = set()
+        New messages arrive at the end of the list. The stored part of the list
+        ends at the last user row whose host timestamp the store holds on a
+        user row. Without such a row, the whole list counts as the end. The
+        text is not part of this test, because a host can show one user message
+        with a note added or removed, and it keeps the timestamp. This relies
+        on one property of a host: two user messages with a tool call between
+        them carry different timestamps.
+
+        Proof, by kind of row:
+
+        - User row with a host timestamp: the store holds a user row with the
+          same timestamp and the same text. The n-th such incoming row needs n
+          stored rows. The timestamp alone is not an identity.
+        - Tool-call turn in the stored part: the store holds a turn with the
+          same provider ids and the same calls (function name and arguments).
+        - Tool result in the stored part: the store holds its id, and the call
+          that it answers in this list is not new. A result answers the nearest
+          earlier call in the list that carries its id in any spelling (``id``
+          or ``call_id``). The content is not compared here, because a host can
+          change the text of an old result. The first stored form stays.
+        - Tool invocation at the end (a tool-call turn and the results in this
+          list that answer it): the store holds the call, and each of those
+          results with the same host timestamp or the same content, after the
+          stored user row with that last timestamp. The content is compared as a
+          replay identity, so a stored externalized or redacted form still
+          matches. One new result makes the whole invocation new. After a user
+          row with a new host timestamp, every invocation is new.
+        - A provider id proves nothing when the provider uses it again: the
+          incoming list holds the id on two calls or on two tool results, or
+          the store holds it with two different calls. A row with such an id
+          is new.
+        - Any other row (assistant text, a user row without a timestamp): the
+          store holds a row with the same role, host timestamp and text, or it
+          holds the text directly after the stored copy of the row before it,
+          or directly before the stored copy of the row after it, and that
+          neighbor is a proven copy of one of the kinds above. Each stored
+          neighbor pair proves one incoming row, and n incoming rows with one
+          text need n stored rows with that text.
+        - A row that only a stored neighbor could prove, and that sits after
+          the last proven copy of the list, is new. The stored rows cannot tell
+          the last answer of a stored turn from a new answer with the same
+          text, because an earlier pass can have stored another row with that
+          text at the same place.
+        """
+        skipped: set[int] = set()
+        neighbor_keys: dict[int, tuple[Any, ...]] = {}
+        text_keys: dict[int, tuple[str, str]] = {}
+        stamped_text_keys: dict[int, tuple[Any, ...]] = {}
+        call_rows: dict[int, tuple[tuple[str, ...], tuple[Any, ...]]] = {}
+        call_results: dict[int, list[int]] = {}
+        tool_rows: dict[int, str] = {}
+        tool_owner: dict[int, int] = {}
+        incoming_call_id_uses: dict[str, int] = {}
+        incoming_tool_id_uses: dict[str, int] = {}
+        alias_owner: dict[str, int] = {}
         for idx, msg in enumerate(messages):
             if (
                 self._is_replayed_context_scaffold_message(msg)
@@ -1015,35 +1127,246 @@ class ReconcileMixin:
             ):
                 # These are never persisted by _ingest_messages, so they can
                 # neither be a delta nor proof that something is stored.
+                skipped.add(idx)
                 continue
             role = str(msg.get("role") or "unknown")
             tool_call_id = str(msg.get("tool_call_id") or "")
             if role == "tool" and tool_call_id:
-                if tool_call_id in stored_tool_ids or tool_call_id in seen_tool_ids:
-                    already_stored += 1
-                else:
-                    new_indices.append(idx)
-                seen_tool_ids.add(tool_call_id)
-                continue
-            tool_calls_identity = self._stable_tool_calls_identity(msg.get("tool_calls"))
-            call_ids = self._tool_call_ids_from_identity(tool_calls_identity)
-            if role == "assistant" and call_ids:
-                if any(
-                    call_id in stored_call_ids or call_id in seen_call_ids
-                    for call_id in call_ids
-                ):
-                    already_stored += 1
-                else:
-                    new_indices.append(idx)
-                seen_call_ids.update(call_ids)
+                tool_rows[idx] = tool_call_id
+                neighbor_keys[idx] = ("tool", tool_call_id)
+                incoming_tool_id_uses[tool_call_id] = incoming_tool_id_uses.get(tool_call_id, 0) + 1
+                owner = alias_owner.get(tool_call_id)
+                if owner is not None:
+                    tool_owner[idx] = owner
+                    call_results[owner].append(idx)
                 continue
             _role, content, _tool_call_id, identity_tool_calls = self._message_replay_identity(msg)
+            if role == "assistant":
+                call_ids = self._tool_call_ids_from_identity(identity_tool_calls)
+                if call_ids:
+                    signature = self._tool_call_signature_from_identity(identity_tool_calls)
+                    call_rows[idx] = (call_ids, signature)
+                    call_results[idx] = []
+                    neighbor_keys[idx] = ("call", call_ids)
+                    for call_id, _form in signature:
+                        incoming_call_id_uses[call_id] = incoming_call_id_uses.get(call_id, 0) + 1
+                    for alias in self._tool_call_aliases_from_identity(identity_tool_calls) | frozenset(call_ids):
+                        alias_owner[alias] = idx
+                    continue
             key = self._multiset_text_identity(role, content or "", identity_tool_calls)
-            incoming_text_counts[key] = incoming_text_counts.get(key, 0) + 1
-            if incoming_text_counts[key] > stored_text_counts.get(key, 0):
-                new_indices.append(idx)
+            text_keys[idx] = key
+            observed_at = _normalize_observed_at(msg.get("timestamp"))
+            if observed_at is not None:
+                if role == "user":
+                    neighbor_keys[idx] = ("user", observed_at, key)
+                else:
+                    stamped_text_keys[idx] = ("stamped", observed_at, key)
+        wanted_text_keys = set(text_keys.values())
+        wanted_stamped_text_keys = set(stamped_text_keys.values())
+        wanted_tool_ids = set(tool_rows.values())
+
+        # Each "place" below is the number of a stored row in session order.
+        stored_tool_ids: set[str] = set()
+        stored_tool_times: dict[tuple[str, float], int] = {}
+        stored_tool_contents: dict[tuple[str, str], int] = {}
+        stored_tool_digests: dict[tuple[str, str], str] = {}
+        stored_calls: dict[tuple[tuple[str, ...], tuple[Any, ...]], int] = {}
+        stored_call_forms: dict[str, set[str]] = {}
+        stored_user_rows: dict[tuple[Any, ...], int] = {}
+        stored_user_time_places: dict[float, int] = {}
+        stored_stamped_text_rows: dict[tuple[Any, ...], int] = {}
+        stored_text_rows: dict[tuple[str, str], int] = {}
+        stored_after: dict[tuple[Any, ...], int] = {}
+        stored_before: dict[tuple[Any, ...], int] = {}
+        previous_neighbor_key: tuple[Any, ...] | None = None
+        previous_text_key: tuple[str, str] | None = None
+        stored_rows = 0
+        for row in self._store.iter_session_message_identities(self._session_id):
+            stored_rows += 1
+            role = str(row.get("role") or "unknown")
+            tool_call_id = str(row.get("tool_call_id") or "")
+            neighbor_key: tuple[Any, ...] | None = None
+            key: tuple[str, str] | None = None
+            if role == "tool" and tool_call_id:
+                stored_tool_ids.add(tool_call_id)
+                neighbor_key = ("tool", tool_call_id)
+                if tool_call_id in wanted_tool_ids:
+                    # A session can hold many stored copies of one result, so the
+                    # replay identity is built once for each stored form.
+                    if row.get("observed_at") is not None:
+                        stored_tool_times[(tool_call_id, float(row["observed_at"]))] = stored_rows
+                    raw_form = (tool_call_id, self._replay_content_digest(str(row.get("content") or "")))
+                    digest = stored_tool_digests.get(raw_form)
+                    if digest is None:
+                        digest = self._replay_content_digest(
+                            self._compute_message_replay_identity(row, stored_row=True)[1]
+                        )
+                        stored_tool_digests[raw_form] = digest
+                    stored_tool_contents[(tool_call_id, digest)] = stored_rows
             else:
+                # Read the provider ids straight from the stored tool calls. The
+                # canonical identity is built only for a row that needs it: a
+                # stored row is computed directly, not through the per-pass memo,
+                # because the memo keeps every row that it sees until the pass
+                # ends, and this loop reads the whole session.
+                call_ids = self._tool_call_ids_from_calls(row.get("tool_calls")) if role == "assistant" else ()
+                if call_ids:
+                    neighbor_key = ("call", call_ids)
+                    if any(call_id in incoming_call_id_uses for call_id in call_ids):
+                        signature = self._tool_call_signature_from_identity(
+                            self._compute_message_replay_identity(row, stored_row=True)[3]
+                        )
+                        stored_calls[(call_ids, signature)] = stored_rows
+                        for call_id, form in signature:
+                            stored_call_forms.setdefault(call_id, set()).add(form)
+                else:
+                    _role, content, _tool_call_id, identity_tool_calls = self._compute_message_replay_identity(
+                        row, stored_row=True
+                    )
+                    key = self._multiset_text_identity(role, content or "", identity_tool_calls)
+                    if key in wanted_text_keys:
+                        stored_text_rows[key] = stored_text_rows.get(key, 0) + 1
+                    if row.get("observed_at") is not None:
+                        if role == "user":
+                            neighbor_key = ("user", float(row["observed_at"]), key)
+                            stored_user_rows[neighbor_key] = stored_user_rows.get(neighbor_key, 0) + 1
+                            stored_user_time_places[neighbor_key[1]] = stored_rows
+                        else:
+                            stamped_key = ("stamped", float(row["observed_at"]), key)
+                            if stamped_key in wanted_stamped_text_keys:
+                                stored_stamped_text_rows[stamped_key] = stored_stamped_text_rows.get(stamped_key, 0) + 1
+            if neighbor_key is None:
+                if previous_neighbor_key is not None and key in wanted_text_keys:
+                    pair = (previous_neighbor_key, key)
+                    stored_after[pair] = stored_after.get(pair, 0) + 1
+                previous_neighbor_key, previous_text_key = None, key
+            else:
+                if previous_text_key is not None and previous_text_key in wanted_text_keys:
+                    pair = (previous_text_key, neighbor_key)
+                    stored_before[pair] = stored_before.get(pair, 0) + 1
+                previous_neighbor_key, previous_text_key = neighbor_key, None
+
+        effective = [idx for idx in range(len(messages)) if idx not in skipped]
+        reused_ids = {call_id for call_id, uses in incoming_call_id_uses.items() if uses > 1}
+        reused_ids.update(call_id for call_id, uses in incoming_tool_id_uses.items() if uses > 1)
+        reused_ids.update(call_id for call_id, forms in stored_call_forms.items() if len(forms) > 1)
+
+        # User rows with a host timestamp. The stored part of the list ends at
+        # the last one whose timestamp the store holds.
+        proven_copies: set[int] = set()
+        seen_user_rows: dict[tuple[Any, ...], int] = {}
+        stored_part_end = -1
+        stored_part_end_place = 0
+        for position, idx in enumerate(effective):
+            user_row = neighbor_keys.get(idx)
+            if user_row is None or user_row[0] != "user":
+                continue
+            seen_user_rows[user_row] = seen_user_rows.get(user_row, 0) + 1
+            if seen_user_rows[user_row] <= stored_user_rows.get(user_row, 0):
+                proven_copies.add(idx)
+            if user_row[1] in stored_user_time_places:
+                stored_part_end = position
+                stored_part_end_place = stored_user_time_places[user_row[1]]
+
+        def result_id_is_stored(idx: int) -> bool:
+            return tool_rows[idx] in stored_tool_ids and tool_rows[idx] not in reused_ids
+
+        def result_is_stored_at_the_end(idx: int) -> bool:
+            if not result_id_is_stored(idx):
+                return False
+            tool_call_id = tool_rows[idx]
+            observed_at = _normalize_observed_at(messages[idx].get("timestamp"))
+            if observed_at is not None and stored_tool_times.get((tool_call_id, observed_at), 0) > stored_part_end_place:
+                return True
+            digest = self._replay_content_digest(self._message_replay_identity(messages[idx])[1])
+            return stored_tool_contents.get((tool_call_id, digest), 0) > stored_part_end_place
+
+        # Tool-call turns and tool results.
+        after_new_user_row = False
+        for position, idx in enumerate(effective):
+            at_the_end = position > stored_part_end
+            if idx in call_rows:
+                call = call_rows[idx]
+                results = call_results[idx]
+                if call not in stored_calls or not reused_ids.isdisjoint(call[0]):
+                    continue
+                if not at_the_end:
+                    proven_copies.add(idx)
+                    proven_copies.update(result_idx for result_idx in results if result_id_is_stored(result_idx))
+                elif (
+                    not after_new_user_row
+                    and stored_calls[call] > stored_part_end_place
+                    and all(result_is_stored_at_the_end(result_idx) for result_idx in results)
+                ):
+                    proven_copies.add(idx)
+                    proven_copies.update(results)
+            elif idx in tool_rows:
+                if idx in tool_owner:
+                    continue
+                if not at_the_end:
+                    if result_id_is_stored(idx):
+                        proven_copies.add(idx)
+                elif not after_new_user_row and result_is_stored_at_the_end(idx):
+                    proven_copies.add(idx)
+            elif at_the_end and idx in neighbor_keys:
+                after_new_user_row = True
+
+        # Text rows that the store holds with the same host timestamp.
+        stamp_proven: set[int] = set()
+        seen_stamped_text_rows: dict[tuple[Any, ...], int] = {}
+        for idx in effective:
+            stamped_key = stamped_text_keys.get(idx)
+            if stamped_key is None:
+                continue
+            seen_stamped_text_rows[stamped_key] = seen_stamped_text_rows.get(stamped_key, 0) + 1
+            if seen_stamped_text_rows[stamped_key] <= stored_stamped_text_rows.get(stamped_key, 0):
+                stamp_proven.add(idx)
+
+        # Rows without proof of their own: the stored text beside a proven copy.
+        # Nothing after the last proven copy of the list is a copy.
+        last_proven_position = max(
+            (position for position, idx in enumerate(effective) if idx in proven_copies or idx in stamp_proven),
+            default=-1,
+        )
+        used_after: dict[tuple[Any, ...], int] = {}
+        used_before: dict[tuple[Any, ...], int] = {}
+        used_text_rows: dict[tuple[str, str], int] = {}
+        for idx in stamp_proven:
+            used_text_rows[text_keys[idx]] = used_text_rows.get(text_keys[idx], 0) + 1
+        new_indices: list[int] = []
+        already_stored = 0
+        for position, idx in enumerate(effective):
+            if idx in neighbor_keys:
+                if idx in proven_copies:
+                    already_stored += 1
+                else:
+                    new_indices.append(idx)
+                continue
+            if idx in stamp_proven:
                 already_stored += 1
+                continue
+            key = text_keys[idx]
+            proven = False
+            if position < last_proven_position and used_text_rows.get(key, 0) < stored_text_rows.get(key, 0):
+                if position > 0:
+                    before_idx = effective[position - 1]
+                    if before_idx in proven_copies:
+                        pair = (neighbor_keys[before_idx], key)
+                        if used_after.get(pair, 0) < stored_after.get(pair, 0):
+                            used_after[pair] = used_after.get(pair, 0) + 1
+                            proven = True
+                if not proven and position + 1 < len(effective):
+                    after_idx = effective[position + 1]
+                    if after_idx in proven_copies:
+                        pair = (key, neighbor_keys[after_idx])
+                        if used_before.get(pair, 0) < stored_before.get(pair, 0):
+                            used_before[pair] = used_before.get(pair, 0) + 1
+                            proven = True
+            if proven:
+                used_text_rows[key] = used_text_rows.get(key, 0) + 1
+                already_stored += 1
+            else:
+                new_indices.append(idx)
         return new_indices, stored_rows, already_stored
 
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:

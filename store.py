@@ -975,14 +975,14 @@ class MessageStore:
         after = 0
         while True:
             rows = self._conn.execute(
-                "SELECT store_id, session_id, role, content, tool_call_id, tool_calls "
+                "SELECT store_id, session_id, role, content, tool_call_id, tool_calls, observed_at "
                 "FROM messages WHERE session_id = ? AND store_id > ? "
                 "ORDER BY store_id LIMIT ?",
                 (session_id, after, batch_size),
             ).fetchall()
             if not rows:
                 return
-            for store_id, row_session_id, role, content, tool_call_id, tool_calls in rows:
+            for store_id, row_session_id, role, content, tool_call_id, tool_calls, observed_at in rows:
                 after = int(store_id)
                 if tool_calls:
                     try:
@@ -995,6 +995,7 @@ class MessageStore:
                     "content": content,
                     "tool_call_id": tool_call_id,
                     "tool_calls": tool_calls,
+                    "observed_at": observed_at,
                 }
 
     def get_session_count(self, session_id: str) -> int:
