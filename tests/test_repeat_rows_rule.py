@@ -157,7 +157,7 @@ def test_last_result_with_a_stored_host_timestamp_and_other_content_is_a_copy(tm
 
 
 def test_last_result_in_a_redacted_form_is_a_copy(tmp_path):
-    secret = 'loaded\napi_key = "«redacted:sk-…»"\npassword=hunter2hunter2hunter2'
+    secret = 'loaded\napi_key = "invented-key-0123456789abcdef"\npassword=hunter2hunter2hunter2'
     stored = THREE_TURNS + [_user("show the configuration", 400), _call("call_s"), _result("call_s", secret)]
     added = _replay(
         tmp_path, stored, [SUMMARY] + stored[4:],
@@ -174,7 +174,7 @@ def test_last_result_with_a_large_payload_is_a_copy(tmp_path):
 
 
 def test_same_call_with_a_redacted_argument_is_a_copy(tmp_path):
-    secret_call = _call("call_s", json.dumps({"api_key": "«redacted:sk-…»"}))
+    secret_call = _call("call_s", json.dumps({"api_key": "invented-key-0123456789abcdef"}))
     stored = THREE_TURNS + [_user("deploy it", 400), secret_call, _result("call_s", "deployed"), _answer("done deploying"), THANKS]
     # The summary in front forces the comparison with the stored rows.
     added = _replay(
