@@ -12,12 +12,14 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import weakref
 from collections import deque
 import uuid
 from pathlib import Path
+from types import CodeType, FrameType
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
@@ -147,6 +149,121 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+
+# Tool calls at or over this many seconds log where they spent their time.
+# Grant chose the value; it is also the cutoff of the session-log measurement
+# that found slow lcm_grep calls whose search replays were fast.
+_SLOW_TOOL_CALL_SECONDS = 3.0
+
+# A gateway loads the plugin through a symlink, so frame file names can carry
+# either the loaded path or the resolved one. Both prefixes count as plugin code.
+_PLUGIN_DIR_PREFIXES = tuple(
+    {
+        os.path.dirname(os.path.abspath(__file__)) + os.sep,
+        os.path.dirname(os.path.realpath(__file__)) + os.sep,
+    }
+)
+
+
+def _frame_label(frame: FrameType) -> str:
+    code = frame.f_code
+    return f"{os.path.basename(code.co_filename)}:{frame.f_lineno}:{code.co_name}"
+
+
+def _frames_out_to_code(frame: FrameType, stop_code: CodeType) -> str:
+    """Innermost frame first, out to and including the first frame running ``stop_code``."""
+    labels: list[str] = []
+    current: FrameType | None = frame
+    while current is not None:
+        labels.append(_frame_label(current))
+        if current.f_code is stop_code:
+            break
+        current = current.f_back
+    return "<".join(labels)
+
+
+def _frames_out_to_outermost_plugin_frame(frame: FrameType) -> str:
+    """Innermost frame first, out to the outermost plugin frame; empty without one."""
+    labels: list[str] = []
+    plugin_depth = 0
+    current: FrameType | None = frame
+    while current is not None:
+        labels.append(_frame_label(current))
+        if current.f_code.co_filename.startswith(_PLUGIN_DIR_PREFIXES):
+            plugin_depth = len(labels)
+        current = current.f_back
+    return "<".join(labels[:plugin_depth])
+
+
+class _SlowToolCallLog:
+    """Time one LCM tool call and log where it was if it runs slow.
+
+    A daemon timer samples the calling thread's stack once the threshold
+    passes, so a slow call names its step even when the session log only shows
+    the total. Records hold tool name, session id, timings and frame labels
+    (file base name, line, function); never tool arguments or message text.
+    ``finish`` must run on every exit path: it cancels and joins the timer so
+    no sampler thread outlives the call.
+    """
+
+    def __init__(self, tool: str, session: str, call_code: CodeType) -> None:
+        self._tool = tool
+        self._session = session or "-"
+        self._call_code = call_code
+        self._caller_ident = threading.get_ident()
+        self._threshold = _SLOW_TOOL_CALL_SECONDS
+        self._started = time.monotonic()
+        self._handler_started: float | None = None
+        self._timer = threading.Timer(self._threshold, self._log_running)
+        self._timer.name = f"lcm-slow-tool-call-{tool}"
+        self._timer.daemon = True
+        self._timer.start()
+
+    def enter_handler(self) -> None:
+        self._handler_started = time.monotonic()
+
+    def _log_running(self) -> None:
+        elapsed = time.monotonic() - self._started
+        phase = "ingest" if self._handler_started is None else "handler"
+        sampler_ident = threading.get_ident()
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        frames = sys._current_frames()
+        caller_frame = frames.get(self._caller_ident)
+        stack = "-" if caller_frame is None else _frames_out_to_code(caller_frame, self._call_code)
+        others = []
+        for ident, frame in frames.items():
+            if ident in (self._caller_ident, sampler_ident):
+                continue
+            plugin_frames = _frames_out_to_outermost_plugin_frame(frame)
+            if plugin_frames:
+                others.append(f"{names.get(ident, ident)}@{plugin_frames}")
+        logger.info(
+            "LCM slow tool call running: tool=%s session=%s elapsed=%.3fs phase=%s stack=%s others=%s",
+            self._tool,
+            self._session,
+            elapsed,
+            phase,
+            stack,
+            ";".join(others) or "-",
+        )
+
+    def finish(self, live_messages: int) -> None:
+        self._timer.cancel()
+        self._timer.join()
+        ended = time.monotonic()
+        total = ended - self._started
+        if total < self._threshold:
+            return
+        handler_started = ended if self._handler_started is None else self._handler_started
+        logger.info(
+            "LCM slow tool call done: tool=%s session=%s total=%.3fs ingest=%.3fs handler=%.3fs live_messages=%d",
+            self._tool,
+            self._session,
+            total,
+            handler_started - self._started,
+            ended - handler_started,
+            live_messages,
+        )
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -3919,41 +4036,45 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
+        slow_call_log = _SlowToolCallLog(name, self.current_session_id, sys._getframe().f_code)
+        try:
+            if name != "lcm_inspect" and messages and self._session_id:
+                if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                    self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+                elif not (
+                    self._session_ignored or self._session_stateless or self._thread_context_stateless()
+                ):
+                    try:
+                        self._ingest_messages(messages)
+                        self._record_ingest_success()
+                        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    except Exception as e:
+                        self._record_ingest_failure("tool-call ingest", e)
 
-        if name != "lcm_inspect" and messages and self._session_id:
-            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
-                try:
-                    self._ingest_messages(messages)
-                    self._record_ingest_success()
-                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                except Exception as e:
-                    self._record_ingest_failure("tool-call ingest", e)
-
-        handlers = {
-            "lcm_grep": lcm_tools.lcm_grep,
-            "lcm_recall": lcm_tools.lcm_recall,
-            "lcm_query_state": lcm_tools.lcm_query_state,
-            "lcm_compute": lcm_tools.lcm_compute,
-            "lcm_compile_evidence": lcm_tools.lcm_compile_evidence,
-            "lcm_evidence_pack": lcm_tools.lcm_evidence_pack,
-            "lcm_retrieve": lcm_tools.lcm_retrieve,
-            "lcm_recent": lcm_tools.lcm_recent,
-            "lcm_load_session": lcm_tools.lcm_load_session,
-            "lcm_describe": lcm_tools.lcm_describe,
-            "lcm_expand": lcm_tools.lcm_expand,
-            "lcm_expand_query": lcm_tools.lcm_expand_query,
-            "lcm_status": lcm_tools.lcm_status,
-            "lcm_inspect": lcm_tools.lcm_inspect,
-            "lcm_doctor": lcm_tools.lcm_doctor,
-        }
-        handler = handlers.get(name)
-        if handler:
-            return handler(args, engine=self)
-        return json.dumps({"error": f"Unknown LCM tool: {name}"})
+            handlers = {
+                "lcm_grep": lcm_tools.lcm_grep,
+                "lcm_recall": lcm_tools.lcm_recall,
+                "lcm_query_state": lcm_tools.lcm_query_state,
+                "lcm_compute": lcm_tools.lcm_compute,
+                "lcm_compile_evidence": lcm_tools.lcm_compile_evidence,
+                "lcm_evidence_pack": lcm_tools.lcm_evidence_pack,
+                "lcm_retrieve": lcm_tools.lcm_retrieve,
+                "lcm_recent": lcm_tools.lcm_recent,
+                "lcm_load_session": lcm_tools.lcm_load_session,
+                "lcm_describe": lcm_tools.lcm_describe,
+                "lcm_expand": lcm_tools.lcm_expand,
+                "lcm_expand_query": lcm_tools.lcm_expand_query,
+                "lcm_status": lcm_tools.lcm_status,
+                "lcm_inspect": lcm_tools.lcm_inspect,
+                "lcm_doctor": lcm_tools.lcm_doctor,
+            }
+            handler = handlers.get(name)
+            slow_call_log.enter_handler()
+            if handler:
+                return handler(args, engine=self)
+            return json.dumps({"error": f"Unknown LCM tool: {name}"})
+        finally:
+            slow_call_log.finish(live_messages=len(messages) if messages else 0)
 
     def _database_path_source(self) -> str:
         if self._config.database_path:

@@ -4,8 +4,18 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
+### Added
+
+- LCM tool calls that take 3 seconds or more log two INFO records:
+  `LCM slow tool call running` (the calling thread's stack and other plugin
+  threads at the 3-second mark) and `LCM slow tool call done` (total, ingest
+  and handler time). Neither holds tool arguments or message text.
+
 ### Fixed
 
+- Broad newest-first message searches no longer time out on large stores.
+  `MessageStore.search` now picks the result row ids first and computes rank,
+  snippet and columns only for those rows; results are unchanged.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
 - Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 - SQLite artifact hardening no longer opens a descriptor on an existing
