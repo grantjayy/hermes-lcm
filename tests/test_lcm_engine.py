@@ -3935,8 +3935,8 @@ class TestEngineABC:
         )
         persisted_messages = [
             {"role": "system", "content": "You are concise."},
-            {"role": "user", "content": "fresh user tail"},
-            {"role": "assistant", "content": "fresh assistant tail"},
+            {"role": "user", "content": "fresh user tail", "timestamp": 1_795_000_000.0},
+            {"role": "assistant", "content": "fresh assistant tail", "timestamp": 1_795_000_060.0},
         ]
         before_restart._ingest_messages(persisted_messages)
         before_restart._store.close()
@@ -3959,8 +3959,8 @@ class TestEngineABC:
                 "role": "assistant",
                 "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
             },
-            {"role": "user", "content": "fresh user tail"},
-            {"role": "assistant", "content": "fresh assistant tail"},
+            {"role": "user", "content": "fresh user tail", "timestamp": 1_795_000_000.0},
+            {"role": "assistant", "content": "fresh assistant tail", "timestamp": 1_795_000_060.0},
             {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_2", "type": "function"}]},
             {"role": "tool", "tool_call_id": "call_2", "content": "tool output after compacted restart"},
         ]
@@ -3968,10 +3968,14 @@ class TestEngineABC:
         after_restart._ingest_messages(active_context)
 
         rows = after_restart._store.get_session_messages("compacted-session")
+        # The fresh tail ("fresh user tail" / "fresh assistant tail") is already
+        # durable; a restart replay must not store it a second time (re-ingest
+        # duplication fix).  Only the genuinely new tool turn is appended.
+        # The host timestamps of the two messages prove the copies. Without a
+        # timestamp the answer would be stored again, because it sits after the
+        # last proven copy of the list.
         assert [row["role"] for row in rows] == [
             "system",
-            "user",
-            "assistant",
             "user",
             "assistant",
             "assistant",

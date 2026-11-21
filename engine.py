@@ -692,7 +692,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # gateway restart reconcile it against the durable store on the
         # next ingest.
         self._ingest_cursor: int = 0
+        # Replay identities of the list that the cursor was last set to the end
+        # of when this engine handed that list back to the host. See
+        # _set_ingest_cursor_to_returned_list.
+        self._ingest_cursor_list_identities: Optional[list[tuple[Any, ...]]] = None
         self._ingest_cursor_needs_reconcile = False
+        # When multiset reconciliation runs, it returns cursor=0 (there is no
+        # contiguous prefix to advance) and records the exact incoming indexes
+        # that are genuinely new.  _ingest_messages consumes and clears this on
+        # the same call.
+        self._reconcile_multiset_persist_indices: list[int] | None = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -3761,7 +3770,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    # The host also calls this hook at a compaction commit with
+                    # the list from BEFORE the compaction, and then continues
+                    # the conversation with the compacted list. The flush stores
+                    # what is missing, but the ingest position must keep
+                    # describing the list that the host continues with.
+                    cursor_before_flush = self._ingest_cursor
+                    needs_reconcile_before_flush = self._ingest_cursor_needs_reconcile
+                    returned_list_before_flush = getattr(self, "_ingest_cursor_list_identities", None)
+                    self._ingest_cursor_list_identities = None
+                    try:
+                        self._ingest_messages(messages)
+                    finally:
+                        self._ingest_cursor = cursor_before_flush
+                        self._ingest_cursor_needs_reconcile = needs_reconcile_before_flush
+                        self._ingest_cursor_list_identities = returned_list_before_flush
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -4399,6 +4422,64 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: message ingestion ---------------------------------------
 
+    def _set_ingest_cursor_to_returned_list(self, messages: List[Dict[str, Any]]) -> None:
+        """Point the ingest cursor at the end of a list that goes back to the host.
+
+        The cursor is only a length. The host can change the returned list
+        before it continues with it (it removes a finished todo snapshot, for
+        example), and a cursor past the end of the shorter list hides the next
+        new message. So the identities of the returned rows are kept, and the
+        next ingest trusts the cursor only as far as the rows still match.
+        """
+        self._ingest_cursor = len(messages)
+        self._ingest_cursor_list_identities = [
+            self._message_replay_identity(message) for message in messages
+        ]
+
+    def _verify_ingest_cursor_against_returned_list(
+        self,
+        messages: List[Dict[str, Any]],
+        persisted_prefix_len: Optional[int],
+    ) -> None:
+        """Lower the cursor to the rows that still match the list it was set for.
+
+        When the host changed the returned list, the cursor proves nothing past
+        the first changed row. The stored rows of the session then decide what
+        is new, as they do after a compaction notice. A session without stored
+        rows (a new session id after the compaction) has nothing to compare
+        with, so the rows after the verified prefix are stored.
+        """
+        returned_identities = getattr(self, "_ingest_cursor_list_identities", None)
+        self._ingest_cursor_list_identities = None
+        if (
+            returned_identities is None
+            or self._ingest_cursor_needs_reconcile
+            or len(returned_identities) != self._ingest_cursor
+        ):
+            return
+        if persisted_prefix_len is not None and persisted_prefix_len > self._ingest_cursor:
+            # The host handed back the list that the last ingest processed to
+            # its end. That proof moves the cursor forward by itself.
+            return
+        verified = 0
+        limit = min(len(returned_identities), len(messages))
+        while (
+            verified < limit
+            and self._message_replay_identity(messages[verified]) == returned_identities[verified]
+        ):
+            verified += 1
+        if verified < len(returned_identities):
+            logger.info(
+                "LCM ingest cursor lowered to the verified prefix of the returned list: "
+                "session=%s cursor=%d -> %d incoming=%d",
+                self._session_id,
+                self._ingest_cursor,
+                verified,
+                len(messages),
+            )
+            self._ingest_cursor = verified
+            self._schedule_ingest_cursor_reconciliation()
+
     def _schedule_ingest_cursor_reconciliation(self) -> None:
         """Mark existing-session rebinds for cursor repair on next ingest."""
         self._ingest_cursor_needs_reconcile = False
@@ -4537,6 +4618,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             copied_replay_messages.append(copied_message)
         return copied_replay_messages
 
+    def _persisted_prefix_len(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        """How much of ``messages`` still matches the last history ingest completed.
+
+        ``_last_active_replay_source_identities`` holds the replay identities of
+        the list the previous ingest processed to its end, so every row of that
+        list is accounted for: stored, or deliberately dropped by the ignore and
+        placeholder filters. The session stamp beside it keeps the proof from
+        crossing a rebind.
+
+        The returned length is the longest common prefix, which the caller reads
+        two ways. Longer than the cursor: rows the cursor calls new are already
+        accounted for, so it can advance. Shorter: the history changed inside the
+        range the cursor calls persisted, so the cursor indexes a list that no
+        longer exists and must be re-derived from the store.
+
+        Returns None when there is no usable proof (no cache, or another
+        session's).
+        """
+        cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+        cached_session_id = str(getattr(self, "_last_active_replay_session_id", "") or "")
+        if not cached_source_identities or cached_session_id != self._session_id:
+            return None
+        prefix_len = min(len(cached_source_identities), len(messages))
+        for idx in range(prefix_len):
+            if self._message_replay_identity(messages[idx]) != cached_source_identities[idx]:
+                return idx
+        return prefix_len
+
     def _remember_active_replay_messages(
         self,
         original_messages: List[Dict[str, Any]],
@@ -4545,6 +4654,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
+        # Scope the identities above to their session. _persisted_prefix_len reads
+        # them as proof that ingest accounted for those rows, and nothing clears
+        # this cache when the engine rebinds to another session.
+        self._last_active_replay_session_id = self._session_id
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
@@ -4782,6 +4895,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
+        persisted_prefix_len = self._persisted_prefix_len(messages)
+        self._verify_ingest_cursor_against_returned_list(messages, persisted_prefix_len)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
@@ -4818,54 +4933,83 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
-        if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
+        # Turn-start cost: memoise replay identities for the reconcile +
+        # cached-prefix checks, which re-identify the same rows several times.
+        with self._replay_identity_memo_scope():
+            if self._ingest_cursor_needs_reconcile:
+                reconcile_messages = [
+                    original_msg
+                    if (
+                        (
+                            str(original_msg.get("role") or "") == "tool"
+                            and _is_hermes_persisted_output_marker(
+                                normalize_content_value(original_msg.get("content")) or ""
+                            )
+                            and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
                         )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
+                        or (
+                            self._compiled_ignore_message_patterns
+                            and ignored_original_messages[idx]
+                        )
                     )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
-            self._ingest_cursor_needs_reconcile = False
-        cursor = min(max(self._ingest_cursor, 0), n)
-        if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
-            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
-            if (
-                cached_source_identities is not None
-                and cached_active_replay_messages is not None
-                and len(cached_source_identities) >= cursor
-                and len(cached_active_replay_messages) >= cursor
-            ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
+                    else replay_msg
+                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
                 ]
-                if current_prefix_identities == cached_source_identities[:cursor]:
-                    replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
+                self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+                self._ingest_cursor_needs_reconcile = False
+            if persisted_prefix_len is not None and persisted_prefix_len > self._ingest_cursor:
+                # The host handed back a history this session already ingested to its
+                # end, extended or not. compress() lowers the cursor to the compacted
+                # length, and a host that then passes the PRE-compaction list to
+                # on_session_end (end-of-session extraction runs at the compaction
+                # boundary) would have every row past the lowered cursor look new, so
+                # the whole history is appended a second time.
+                logger.info(
+                    "LCM ingest cursor advanced past the last persisted history: session=%s cursor=%d -> %d incoming=%d",
+                    self._session_id,
+                    self._ingest_cursor,
+                    persisted_prefix_len,
+                    n,
+                )
+                self._ingest_cursor = persisted_prefix_len
+            cursor = min(max(self._ingest_cursor, 0), n)
+            if cursor > 0:
+                cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+                cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+                if (
+                    cached_source_identities is not None
+                    and cached_active_replay_messages is not None
+                    and len(cached_source_identities) >= cursor
+                    and len(cached_active_replay_messages) >= cursor
+                ):
+                    current_prefix_identities = [
+                        self._message_replay_identity(message) for message in messages[:cursor]
+                    ]
+                    if current_prefix_identities == cached_source_identities[:cursor]:
+                        replay_messages = (
+                            self._copy_active_replay_messages_preserving_generated_ids(
+                                cached_active_replay_messages[:cursor]
+                            )
+                            + replay_messages[cursor:]
                         )
-                        + replay_messages[cursor:]
-                    )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
         )
 
-        new_messages = replay_messages[cursor:] if cursor < n else []
-        original_new_messages = messages[cursor:] if cursor < n else []
+        pending_persist_indices = self._reconcile_multiset_persist_indices
+        self._reconcile_multiset_persist_indices = None
+        if pending_persist_indices is None:
+            new_message_indices = list(range(cursor, n))
+        else:
+            # Multiset reconciliation selected non-prefix messages: persist
+            # only those, in incoming order.  Everything else in the replay is
+            # already durable.  The cursor still advances to n at the end.
+            new_message_indices = [
+                idx for idx in pending_persist_indices if cursor <= idx < n
+            ]
+        new_messages = [replay_messages[idx] for idx in new_message_indices]
+        original_new_messages = [messages[idx] for idx in new_message_indices]
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
@@ -4891,8 +5035,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 empty_session_placeholder_budget = {}
                 empty_session_placeholder_ordinals = {}
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
-            (cursor + offset, replay_msg)
-            for offset, replay_msg in enumerate(new_messages)
+            (idx, replay_messages[idx]) for idx in new_message_indices
         ]
         if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
@@ -4947,8 +5090,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     for msg in new_messages
                 )
             )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                absolute_idx = cursor + offset
+            for absolute_idx, original_msg, replay_msg in zip(
+                new_message_indices, original_new_messages, new_messages
+            ):
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
@@ -6478,7 +6622,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if compressed != original_messages or ingest_cleanup_changed_active_context:
             self._last_compression_status = "overflow_recovery"
             self._last_compression_noop_reason = ""
-            self._ingest_cursor = len(compressed)
+            self._set_ingest_cursor_to_returned_list(compressed)
             self._ingest_cursor_needs_reconcile = False
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
