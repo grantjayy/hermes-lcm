@@ -1,10 +1,11 @@
-"""Loss cases that two plan reviews found in earlier designs of the repeated-row fix.
+"""Loss cases that two plan reviews and one code review found in the repeated-row fix.
 
 Each case drives a real engine through public host callbacks (with a stubbed
 summarizer) and asserts that a new message reaches the store.
 """
 from contextlib import closing
 from copy import deepcopy
+import json
 import sqlite3
 
 import pytest
@@ -255,5 +256,103 @@ def test_second_poll_result_is_archived(tmp_path, monkeypatch, kind, handoff):
         assert any(row["role"] == "assistant" and row["content"] == "second reading" for row in added)
         assert any(row["role"] == "tool" and row["content"] == "sample two" for row in rows)
         assert sum(bool(row["tool_calls"]) for row in added) == 1
+    finally:
+        engine.shutdown()
+
+
+def _stamped_call(call_id, text, at, name="lcm_status", arguments="{}"):
+    return {
+        "role": "assistant", "content": text, "timestamp": float(at),
+        "tool_calls": [{"id": call_id, "call_id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}],
+    }
+
+
+def _stamped_result(call_id, text, at):
+    return {"role": "tool", "tool_call_id": call_id, "content": text, "timestamp": float(at)}
+
+
+def _stamped_answer(text, at):
+    return {"role": "assistant", "content": text, "timestamp": float(at)}
+
+
+def _read_steps(first, last):
+    return [
+        message
+        for n in range(first, last)
+        for message in (
+            _stamped_call(f"unique_{n}", "", 510 + 2 * n, name="read_file", arguments=json.dumps({"path": f"input-{n}.txt"})),
+            _stamped_result(f"unique_{n}", f"Reading {n}: " + "detail " * 320, 511 + 2 * n),
+        )
+    ]
+
+
+def test_second_context_tool_call_is_stored_before_its_result_exists(tmp_path, monkeypatch):
+    # The host hands a context-engine tool call to the engine before the tool result exists. A provider
+    # gives the second run of the tool the id, the name and the arguments of the first run, and two
+    # compactions took the first run and the user row out of the list.
+    _stub_summarizer(monkeypatch)
+    engine = _engine(tmp_path, fresh_tail_count=10, leaf_chunk_tokens=150)
+    engine.threshold_tokens = 170_000
+    try:
+        request = _user("Track the status throughout this investigation", 500)
+        first_call = _stamped_call("call_0", "First status check", 501)
+        engine.handle_tool_call("lcm_status", {}, messages=deepcopy([request, first_call]))
+        before = [request, first_call, _stamped_result("call_0", "First status response", 502)] + _read_steps(1, 19)
+        kept = engine.compress(deepcopy(before), current_tokens=160_000, force=True)
+        assert len(kept) < len(before)
+        engine.on_session_end(S, deepcopy(before))
+        engine.on_session_start(S, boundary_reason="compression", old_session_id=S, platform="cli", conversation_id=CONVERSATION)
+        onward = deepcopy(kept) + _read_steps(19, 38)
+        kept = engine.compress(deepcopy(onward), current_tokens=160_000, force=True)
+        assert len(kept) < len(onward)
+        assert not any(message.get("timestamp") == 500 for message in kept)
+        assert not any(message.get("tool_call_id") == "call_0" for message in kept)
+        engine.on_session_end(S, deepcopy(onward))
+        engine.on_session_start(S, boundary_reason="compression", old_session_id=S, platform="cli", conversation_id=CONVERSATION)
+        stored_before = engine._store.get_session_count(S)
+        second_call = _stamped_call("call_0", "Second status check before finishing", 900)
+        pending = deepcopy(kept) + [second_call]
+        engine.handle_tool_call("lcm_status", {}, messages=deepcopy(pending))
+        engine.ingest(deepcopy(pending) + [_stamped_result("call_0", "Second status response", 901), _stamped_answer("Finished", 902)])
+        added = engine._store.get_session_messages(S, limit=10_000)[stored_before:]
+        assert [(row["role"], row["content"]) for row in added] == [
+            ("assistant", "Second status check before finishing"), ("tool", "Second status response"), ("assistant", "Finished"),
+        ]
+        assert added[0]["tool_calls"]
+    finally:
+        engine.shutdown()
+
+
+def test_edited_message_that_goes_back_to_an_earlier_text_is_stored_after_a_compaction(tmp_path, monkeypatch):
+    # A platform keeps the timestamp of the first send on each edit of a message, and the host takes each
+    # edit as a new message. The second edit goes back to the first text, after a compaction took both
+    # older texts out of the list and a new engine bound to the session.
+    _stub_summarizer(monkeypatch)
+    sent_at = 1_795_000_000
+    before = [
+        _user("Check the build", sent_at), _stamped_answer("Build is running.", sent_at + 5),
+        _user("Check the test build", sent_at), _stamped_answer("Test build is running.", sent_at + 65),
+    ]
+    for n in range(1, 19):
+        before += [_user(f"Follow-up {n}", sent_at + 100 + n * 2), _stamped_answer(f"Follow-up response {n}: " + "detail " * 320, sent_at + 101 + n * 2)]
+    engine = _engine(tmp_path, fresh_tail_count=10, leaf_chunk_tokens=150)
+    engine.threshold_tokens = 170_000
+    try:
+        engine.ingest(deepcopy(before))
+        kept = engine.compress(deepcopy(before), current_tokens=160_000, force=True)
+        assert len(kept) < len(before)
+        assert not any(message.get("timestamp") == sent_at for message in kept)
+        engine.on_session_end(S, deepcopy(before))
+        engine.on_session_start(S, boundary_reason="compression", old_session_id=S, platform="cli", conversation_id=CONVERSATION)
+    finally:
+        engine.shutdown()
+    engine = _engine(tmp_path, fresh_tail_count=10, leaf_chunk_tokens=150)
+    try:
+        stored_before = engine._store.get_session_count(S)
+        engine.ingest(deepcopy(kept) + [_user("Check the build", sent_at), _stamped_answer("The build passed.", sent_at + 500)])
+        added = engine._store.get_session_messages(S, limit=10_000)[stored_before:]
+        assert [(row["role"], row["content"], row["observed_at"]) for row in added] == [
+            ("user", "Check the build", float(sent_at)), ("assistant", "The build passed.", float(sent_at + 500)),
+        ]
     finally:
         engine.shutdown()

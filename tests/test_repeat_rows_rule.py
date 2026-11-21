@@ -212,6 +212,59 @@ def test_same_timestamp_with_another_text_is_new(tmp_path):
     assert _replay(tmp_path, stored, incoming) == [("user", "note one", 400.0)]
 
 
+EDITED = [
+    _user("check the build", 400), _stamped(_answer("the build is running"), 401),
+    _user("check the test build", 400), _stamped(_answer("the test build is running"), 402),
+]
+
+
+def test_edited_message_that_goes_back_to_an_earlier_text_is_new(tmp_path):
+    # A platform can deliver an edited message as a new message with the timestamp of its first send.
+    # The edit goes back to the first text. The store holds that timestamp and text from the first send,
+    # which left the list, in front of the user rows that came later.
+    stored = EDITED + _turn(5, "fifth request", 500) + _turn(6, "sixth request", 600)
+    edited_again = [_user("check the build", 400), _stamped(_answer("the build passed"), 950)]
+    assert _replay(tmp_path, stored, [SUMMARY] + stored[4:] + edited_again) == [
+        ("assistant", "answer 6", None), ("user", "check the build", 400.0), ("assistant", "the build passed", 950.0),
+    ]
+
+
+def test_both_sends_of_an_edited_message_in_the_list_are_copies(tmp_path):
+    # Both texts of one timestamp are in the list and in the store, and no user row came later.
+    stored = THREE_TURNS + EDITED
+    assert _replay(tmp_path, stored, [SUMMARY] + stored[4:]) == []
+
+
+def test_user_row_that_goes_back_to_a_stored_form_is_stored_again(tmp_path):
+    # The price of the test for an edited message. A host can show one user message with a note and later
+    # without it. The store holds both forms, and the form with the note is the newer one. The list shows
+    # the form without the note again. It cannot be told from an edit back to that form, so it is stored
+    # once more, with the open turn after it and the last answer before it. The next list with that form
+    # stores nothing.
+    fourth = [_user("fourth request", 400), _call("call_4"), _result("call_4", "result 4")]
+    with_note = _user("fourth request\n\n[a note that the host added]", 400)
+    without_note = [SUMMARY] + THREE_TURNS[4:] + fourth
+    _ingest_with_new_engine(tmp_path, THREE_TURNS + fourth)
+    _ingest_with_new_engine(tmp_path, [SUMMARY] + THREE_TURNS[4:] + [with_note] + fourth[1:])
+    count = len(_stored(tmp_path))
+    assert count == len(THREE_TURNS) + len(fourth) + 1
+    _ingest_with_new_engine(tmp_path, without_note)
+    assert _stored(tmp_path)[count:] == [
+        LAST_ANSWER, ("user", "fourth request", 400.0), ("assistant", "", None), ("tool", "result 4", None),
+    ]
+    _ingest_with_new_engine(tmp_path, without_note)
+    assert len(_stored(tmp_path)) == count + 4
+
+
+def test_list_that_ends_before_the_newest_stored_user_row_stores_only_its_last_answer(tmp_path):
+    # A host can hand over a list that ends before the newest stored user row. Its last user row is a
+    # copy: only a stored row with the same timestamp and another text makes a user row new.
+    _ingest_with_new_engine(tmp_path, THREE_TURNS + [THANKS])
+    count = len(_stored(tmp_path))
+    _ingest_with_new_engine(tmp_path, [SUMMARY] + THREE_TURNS[4:])
+    assert _stored(tmp_path)[count:] == [LAST_ANSWER]
+
+
 def test_text_only_conversation_after_a_summary_keeps_the_new_turn(tmp_path):
     stored = [message for n in range(6) for message in (_user(f"question {n}", 100 + n), _answer(f"answer {n}"))]
     incoming = [SUMMARY] + stored[-6:] + [_user("question 0", 200), _answer("a new answer")]
@@ -327,6 +380,26 @@ def test_second_run_with_the_same_result_after_a_new_request_is_new(tmp_path):
     added = _replay(tmp_path, stored, [SUMMARY] + stored[4:9] + second_run)
     assert [row[:2] for row in added] == [
         ("user", "check it again"), ("assistant", ""), ("tool", "sample one"), ("assistant", "the same reading"),
+    ]
+
+
+def test_call_without_its_result_at_the_end_is_new(tmp_path):
+    # A host can hand over a tool call before the tool ran. The store holds the id, the name and the arguments
+    # of the first run, which left the list. A call alone does not show that this run is stored.
+    stored = [_user("check the station"), *_poll("call_constant", "sample one"), _answer("first reading")] + _turn(2, "second request") + _turn(3, "third request")
+    second_call, second_result = _poll("call_constant", "sample two")
+    second_call["content"] = "checking the station again"
+    pending = [SUMMARY] + stored[4:] + [second_call]
+    _ingest_with_new_engine(tmp_path, stored)
+    engine = _engine(tmp_path)
+    try:
+        engine.ingest(_copy(pending))
+        # The same engine then gets the result and the answer.
+        engine.ingest(_copy(pending + [second_result, _answer("second reading")]))
+    finally:
+        engine.shutdown()
+    assert [row[:2] for row in _stored(tmp_path)[-3:]] == [
+        ("assistant", "checking the station again"), ("tool", "sample two"), ("assistant", "second reading"),
     ]
 
 

@@ -1078,6 +1078,12 @@ class ReconcileMixin:
         - User row with a host timestamp: the store holds a user row with the
           same timestamp and the same text. The n-th such incoming row needs n
           stored rows. The timestamp alone is not an identity.
+        - The last user row of the list with one timestamp is a copy only when
+          the last stored user row with that timestamp has its text. A platform
+          can deliver an edited message as a new message with the timestamp of
+          its first send, and an edit can go back to an earlier text. The store
+          then holds that timestamp and text from the first send, in front of
+          the row with the text between them.
         - Tool-call turn in the stored part: the store holds a turn with the
           same provider ids and the same calls (function name and arguments).
         - Tool result in the stored part: the store holds its id, and the call
@@ -1090,8 +1096,11 @@ class ReconcileMixin:
           results with the same host timestamp or the same content, after the
           stored user row with that last timestamp. The content is compared as a
           replay identity, so a stored externalized or redacted form still
-          matches. One new result makes the whole invocation new. After a user
-          row with a new host timestamp, every invocation is new.
+          matches. One new result makes the whole invocation new. So does a
+          call without its result in the list: a host can hand over a tool
+          call before the tool ran, and the stored call of an earlier run shows
+          nothing about this run. After a user row with a new host timestamp,
+          every invocation is new.
         - A provider id proves nothing when the provider uses it again: the
           incoming list holds the id on two calls or on two tool results, or
           the store holds it with two different calls. A row with such an id
@@ -1173,6 +1182,7 @@ class ReconcileMixin:
         stored_calls: dict[tuple[tuple[str, ...], tuple[Any, ...]], int] = {}
         stored_call_forms: dict[str, set[str]] = {}
         stored_user_rows: dict[tuple[Any, ...], int] = {}
+        stored_user_places: dict[tuple[Any, ...], int] = {}
         stored_user_time_places: dict[float, int] = {}
         stored_stamped_text_rows: dict[tuple[Any, ...], int] = {}
         stored_text_rows: dict[tuple[str, str], int] = {}
@@ -1230,6 +1240,7 @@ class ReconcileMixin:
                         if role == "user":
                             neighbor_key = ("user", float(row["observed_at"]), key)
                             stored_user_rows[neighbor_key] = stored_user_rows.get(neighbor_key, 0) + 1
+                            stored_user_places[neighbor_key] = stored_rows
                             stored_user_time_places[neighbor_key[1]] = stored_rows
                         else:
                             stamped_key = ("stamped", float(row["observed_at"]), key)
@@ -1257,16 +1268,27 @@ class ReconcileMixin:
         seen_user_rows: dict[tuple[Any, ...], int] = {}
         stored_part_end = -1
         stored_part_end_place = 0
+        last_row_with_time: dict[float, int] = {}
         for position, idx in enumerate(effective):
             user_row = neighbor_keys.get(idx)
             if user_row is None or user_row[0] != "user":
                 continue
+            last_row_with_time[user_row[1]] = idx
             seen_user_rows[user_row] = seen_user_rows.get(user_row, 0) + 1
             if seen_user_rows[user_row] <= stored_user_rows.get(user_row, 0):
                 proven_copies.add(idx)
             if user_row[1] in stored_user_time_places:
                 stored_part_end = position
                 stored_part_end_place = stored_user_time_places[user_row[1]]
+
+        # An edited message can go back to an earlier text and keep the
+        # timestamp of its first send. The store then holds another text with
+        # that timestamp after the row that seems to be the copy, so the row is
+        # new. The end of the stored part of the list does not change.
+        for idx in last_row_with_time.values():
+            user_row = neighbor_keys[idx]
+            if idx in proven_copies and stored_user_places[user_row] < stored_user_time_places[user_row[1]]:
+                proven_copies.discard(idx)
 
         def result_id_is_stored(idx: int) -> bool:
             return tool_rows[idx] in stored_tool_ids and tool_rows[idx] not in reused_ids
@@ -1296,6 +1318,7 @@ class ReconcileMixin:
                 elif (
                     not after_new_user_row
                     and stored_calls[call] > stored_part_end_place
+                    and len(results) >= len(call[0])
                     and all(result_is_stored_at_the_end(result_idx) for result_idx in results)
                 ):
                     proven_copies.add(idx)
