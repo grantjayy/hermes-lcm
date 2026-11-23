@@ -3512,6 +3512,131 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             conversation_id=conversation_id,
         )
 
+    def _append_off_current_session_end_rows_by_host_id(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        prefix_count: int,
+        *,
+        source: str,
+        conversation_id: str,
+    ) -> List[int | None]:
+        """Late session end of a session that is not the current one.
+
+        The whole list is settled against the ended session's own archive
+        view. A row with a host id is decided by its ids (``_settle_rows_by_host_id``);
+        a row without one keeps the prefix rule: past the stored prefix is new.
+        Every row is judged by the scaffold test (rows with an id) and the
+        ignore filters before it is counted or stored. The foreground session
+        is never read or written here.
+        """
+        view = self._host_id_view(session_id, conversation_id)
+        prepared = self._prepare_host_id_decisions(messages, view=view)
+        skip_flags: dict[int, bool] = {}
+
+        def skip_row(idx: int, *, exact: bool = True) -> bool:
+            if idx not in skip_flags:
+                msg = messages[idx]
+                skip_flags[idx] = bool(
+                    (message_uids_of(msg) and self._is_replayed_context_scaffold_message(msg))
+                    or self._matches_ignore_message_patterns(msg)
+                )
+            return skip_flags[idx]
+
+        entries = self._settle_rows_by_host_id(
+            messages,
+            list(range(max(0, prefix_count), len(messages))),
+            prepared,
+            skip_row=skip_row,
+            finalized=False,
+        )
+        kept: list[Dict[str, Any]] = []
+        originals: list[Dict[str, Any]] = []
+        plans: list[tuple[str, int] | None] = []
+        for idx, uid, plan in entries:
+            msg = messages[idx]
+            if skip_row(idx):
+                self._ignored_message_count += 1
+                continue
+            if uid != message_uid_value(msg):
+                msg = {**msg, "message_uid": uid}
+            kept.append(msg)
+            originals.append(messages[idx])
+            plans.append(plan)
+        if not kept:
+            return []
+        protected_messages = protect_messages_for_ingest(
+            kept,
+            session_id=session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        return self._store._append_protected_batch(
+            session_id,
+            protected_messages,
+            [count_message_tokens(msg) for msg in protected_messages],
+            source=source,
+            conversation_id=conversation_id,
+            uid_plan=plans,
+            uid_view=view,
+            held_decision=self._host_version_decision(
+                list(zip(originals, protected_messages)),
+                finalized=False,
+            ),
+        )
+
+    def _settle_off_current_normal_session_end(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        """Late session end of a normal session without bypass lineage, list with host ids.
+
+        The owner is the ended session in its own conversation: the remembered
+        normal binding of that session in this engine, else the lifecycle
+        record that names it, else no conversation filter. The whole list is
+        settled there by id; a row without an id is new past the prefix that
+        the stored rows or the recorded normal list prove. That conversation's
+        lifecycle is finalized for the ended session, never the foreground's.
+        """
+        conversation_id = self._lcm_session_last_normal_conversation_id.get(session_id) or ""
+        if not conversation_id:
+            try:
+                state = self._lifecycle.get_by_session(session_id)
+            except Exception:
+                logger.debug("LCM late session-end owner lookup failed", exc_info=True)
+                state = None
+            conversation_id = str(getattr(state, "conversation_id", "") or "")
+        prefix_count = max(
+            int(self._session_end_store_prefix_count(
+                session_id, messages, conversation_id=conversation_id or None,
+            ) or 0),
+            self._matching_lcm_normal_prefix_count(
+                session_id, messages, conversation_id=conversation_id or None,
+            ),
+        )
+        self._append_off_current_session_end_rows_by_host_id(
+            session_id,
+            messages,
+            prefix_count,
+            source=(
+                self._lcm_session_last_normal_platform.get(session_id)
+                or self._lcm_session_last_platform.get(session_id, self._session_platform)
+            ),
+            conversation_id=conversation_id,
+        )
+        if not conversation_id:
+            return
+        try:
+            state = self._lifecycle.get_by_conversation(conversation_id)
+            self._lifecycle.finalize_session(
+                conversation_id,
+                session_id,
+                frontier_store_id=state.current_frontier_store_id if state is not None else 0,
+            )
+        except Exception:
+            logger.debug("LCM late session-end lifecycle finalization failed", exc_info=True)
+
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
@@ -3675,7 +3800,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         off_current_store_prefix_for_append = int(off_current_store_prefix_count or 0)
         off_current_recorded_prefix_for_append = 0
-        if off_current_recorded_prefix_count > 0 and off_current_normal_conversation_id:
+        list_has_host_ids = any(message_uids_of(msg) for msg in messages)
+        if (
+            off_current_recorded_prefix_count > 0
+            and off_current_normal_conversation_id
+            and list_has_host_ids
+        ):
+            # The recorded normal prefix positively recognizes this list. A
+            # list with host ids is settled row by row by id, so the count of
+            # stored rows need not equal the logical prefix: a stored version
+            # or merged-row coverage adds physical rows to it.
+            off_current_recorded_prefix_for_append = off_current_recorded_prefix_count
+        elif off_current_recorded_prefix_count > 0 and off_current_normal_conversation_id:
             try:
                 stored_normal_rows = self._store.get_range(
                     session_id,
@@ -3744,17 +3880,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         off_current_should_bypass = off_current_lineage and off_current_prefix_count is None
         if off_current_prefix_count is not None:
             prefix_count = off_current_prefix_count
-            suffix = messages[prefix_count:]
-            if suffix:
-                self._append_off_current_session_end_suffix(
+            late_source = (
+                self._lcm_session_last_normal_platform.get(session_id)
+                or self._lcm_session_last_platform.get(session_id, self._session_platform)
+            )
+            if list_has_host_ids:
+                # A text prefix proves nothing about a row with a host id.
+                self._append_off_current_session_end_rows_by_host_id(
                     session_id,
-                    suffix,
-                    source=(
-                        self._lcm_session_last_normal_platform.get(session_id)
-                        or self._lcm_session_last_platform.get(session_id, self._session_platform)
-                    ),
+                    messages,
+                    prefix_count,
+                    source=late_source,
                     conversation_id=off_current_normal_conversation_id,
                 )
+            else:
+                suffix = messages[prefix_count:]
+                if suffix:
+                    self._append_off_current_session_end_suffix(
+                        session_id,
+                        suffix,
+                        source=late_source,
+                        conversation_id=off_current_normal_conversation_id,
+                    )
             try:
                 state = self._lifecycle.get_by_conversation(off_current_normal_conversation_id)
                 frontier_store_id = state.current_frontier_store_id if state is not None else 0
@@ -3779,6 +3926,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
+        # A normal session that is not the current one, without bypass lineage:
+        # its list with host ids is settled in its own archive, inside the same
+        # bounded flush, never through the foreground binding.
+        settle_in_own_archive = bool(session_id and session_id != self._session_id and list_has_host_ids)
         # Engine clones share these connections. The short session-end timeout
         # must not apply to a sibling's foreground write, and two overlapping
         # session-ends must not interleave their timeout changes. Hold both
@@ -3815,6 +3966,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 _SESSION_END_BUSY_TIMEOUT_MS,
             ):
                 try:
+                    if settle_in_own_archive:
+                        self._settle_off_current_normal_session_end(session_id, messages)
+                        return
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
