@@ -13,6 +13,21 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- LCM no longer stores a conversation again after a compaction or after a
+  new agent binds to a stored session. When LCM cannot find its place in the
+  incoming list, it compares the list with the stored rows of the session and
+  stores what the store does not show it holds. Text alone does not establish
+  that a message is a copy. A row is stored again when nothing in the store
+  shows that it is a copy, for example the last answer of a list without a
+  host timestamp, or a turn on a host that puts no timestamp on user messages.
+  The position search after a restart computes the replay identity of each
+  message once. Known limit: a user message with the host timestamp and the
+  text of a stored user message counts as a copy. A platform that delivers an
+  edited message with the timestamp of its first send can therefore lose the
+  edit in the LCM store, when the text did not change and the first send is no
+  longer in the conversation list. The session record of the host keeps the
+  message. Built on three upstream pull requests: 629 by Kyzcreig (test
+  harness by bogagyn), 695 by subimpact, and 556 by Milgauss.
 - Broad newest-first message searches no longer time out on large stores.
   `MessageStore.search` now picks the result row ids first and computes rank,
   snippet and columns only for those rows; results are unchanged.
