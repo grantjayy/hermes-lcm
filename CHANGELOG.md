@@ -13,6 +13,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- LCM stores the Hermes message id of each row and decides by it whether
+  an incoming row is already stored in the session's view. A finalized
+  change of a message's text, and an answer filled into a message stored
+  blank, are kept as a further row. A late session end is stored in that
+  session's own archive. Rows stored earlier get their id when they come
+  back. Rows without an id keep the earlier rule.
 - LCM no longer stores a conversation again after a compaction or after a
   new agent binds to a stored session. When LCM cannot find its place in the
   incoming list, it compares the list with the stored rows of the session and
