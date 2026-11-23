@@ -20,7 +20,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
@@ -163,6 +163,31 @@ def _normalize_source_value(source: str | None) -> str:
 
 def _normalize_conversation_id_value(conversation_id: str | None) -> str:
     return (conversation_id or "").strip()
+
+
+_MESSAGE_UID_FIRST_OPEN_KEY = "message_uid_first_open_store_id"
+
+
+def message_uid_value(msg: Dict[str, Any]) -> str | None:
+    """The host's durable id of a message, or None when it carries none."""
+    uid = msg.get("message_uid") if isinstance(msg, dict) else None
+    if isinstance(uid, str) and uid.strip():
+        return uid.strip()
+    return None
+
+
+def message_uids_of(msg: Dict[str, Any]) -> list[str]:
+    """The message's own id first, then the ids of messages the host merged into it."""
+    own = message_uid_value(msg)
+    if own is None:
+        return []
+    ids = [own]
+    absorbed = msg.get("_absorbed_message_uids")
+    if isinstance(absorbed, (list, tuple)):
+        for uid in absorbed:
+            if isinstance(uid, str) and uid.strip() and uid.strip() not in ids:
+                ids.append(uid.strip())
+    return ids
 
 
 def _normalize_observed_at(value: Any) -> float | None:
@@ -463,7 +488,50 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        self._ensure_message_uid_column()
         self._conn.commit()
+
+    def _ensure_message_uid_column(self) -> None:
+        """Add the host message id column and its lookup index.
+
+        Hermes gives every stored message a durable ``message_uid``. Rows
+        stored before this column existed keep NULL. The index holds only rows
+        that carry an id, so it starts empty on an existing store.
+        """
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        add_column_if_missing(
+            self._conn, columns, "message_uid",
+            "ALTER TABLE messages ADD COLUMN message_uid TEXT",
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_message_uid ON messages(message_uid) "
+            "WHERE message_uid IS NOT NULL"
+        )
+        # The newest row at the first open by this code. Every row at or below
+        # it was stored before LCM kept host ids. Written once: a later open
+        # keeps the first value. Column presence alone is not this cutoff,
+        # because a store can have the column before this code first opens it.
+        # A healthy reopen only reads (the startup lock contract).
+        if self._conn.execute(
+            "SELECT 1 FROM metadata WHERE key = ?", (_MESSAGE_UID_FIRST_OPEN_KEY,)
+        ).fetchone() is None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO metadata(key, value) "
+                "SELECT ?, CAST(COALESCE(MAX(store_id), 0) AS TEXT) FROM messages",
+                (_MESSAGE_UID_FIRST_OPEN_KEY,),
+            )
+
+    def message_uid_first_open_store_id(self) -> int:
+        """The newest store_id at the first open by this code (0 for a new store)."""
+        row = self._conn.execute(
+            "SELECT value FROM metadata WHERE key = ?", (_MESSAGE_UID_FIRST_OPEN_KEY,)
+        ).fetchone()
+        try:
+            return int(row[0]) if row and row[0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -551,8 +619,8 @@ class MessageStore:
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, observed_at_source, message_uid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -568,6 +636,7 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
+                    message_uid_value(msg),
                 ),
             )
             self._conn.commit()
@@ -597,20 +666,60 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                *,
+                                uid_plan: List[tuple[str, int] | None] | None = None,
+                                uid_view: tuple[tuple[str, ...], str] | None = None,
+                                held_decision: Callable[[int, List[Dict[str, Any]]], bool] | None = None,
+                                ) -> List[int | None]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
         before storage, for example to update active replay with raw-payload
         stubs. Direct callers should use ``append_batch`` so storage-boundary
         payload protection cannot be bypassed accidentally.
+
+        ``uid_plan`` (one entry per message) carries the host-id decision of
+        each row: ``None`` (no host id: insert), ``("new", 0)``, ``("version",
+        0)`` or ``("adopt", store_id)``. With a plan, the rows are settled in
+        input order inside one ``BEGIN IMMEDIATE`` transaction (taken only
+        when some row has a decision). An adoption first writes the id into
+        its target row, only when that row lies in ``uid_view`` (session ids,
+        conversation id) and has no id. Then every planned row is decided
+        against the rows with its id that ``uid_view`` holds at that moment,
+        including rows written earlier in this batch and the row just
+        adopted: none held, the row is inserted; some held, the row is
+        inserted only when ``held_decision(position, held_rows)`` says it is a
+        version, so a planned row is never dropped on a stale read. With
+        ``uid_view`` the result has one entry per message: the new store_id,
+        or None when nothing was inserted for it.
         """
         if token_estimates is None:
             token_estimates = [0] * len(messages)
+        if uid_plan is None:
+            uid_plan = [None] * len(messages)
 
         ids = []
         with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
+            # Only a batch with a host-id decision takes the write lock up
+            # front; a batch without ids keeps the statements it had before.
+            if (
+                uid_view is not None
+                and any(decision is not None for decision in uid_plan)
+                and not self._conn.in_transaction
+            ):
+                self._conn.execute("BEGIN IMMEDIATE")
+            for position, (msg, est, decision) in enumerate(zip(messages, token_estimates, uid_plan)):
+                uid = message_uid_value(msg)
+                content = _normalize_content_value(msg.get("content"))
+                if decision is not None and uid is not None and uid_view is not None:
+                    kind, target = decision
+                    if kind == "adopt":
+                        self.set_message_uids(uid_view, [(target, uid)])
+                    held_rows = self.message_uid_rows([uid], view=uid_view).get(uid, [])
+                    if held_rows and (held_decision is None or not held_decision(position, held_rows)):
+                        ids.append(None)
+                        continue
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
@@ -619,14 +728,14 @@ class MessageStore:
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_at, observed_at_source, message_uid)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
                         _normalize_conversation_id_value(conversation_id),
                         msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
+                        content,
                         msg.get("tool_call_id"),
                         tc_json,
                         msg.get("tool_name"),
@@ -636,10 +745,126 @@ class MessageStore:
                         ts,
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
+                        uid,
                     ),
                 )
                 ids.append(cur.lastrowid)
         return ids
+
+    @staticmethod
+    def _message_uid_view_clause(view: tuple[tuple[str, ...], str]) -> tuple[str, list[Any]]:
+        """SQL for the archive view of a read: its sessions, and its conversation if it has one."""
+        session_ids, conversation_id = view
+        session_ids = tuple(sid for sid in session_ids if sid) or ("",)
+        where = f"session_id IN ({','.join('?' * len(session_ids))})"
+        args: list[Any] = list(session_ids)
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where += f" AND {conversation_clause}"
+            args.extend(conversation_args)
+        return where, args
+
+    def message_uid_rows(
+        self,
+        uids: Iterable[str],
+        *,
+        view: tuple[tuple[str, ...], str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Stored rows in the archive view that carry one of *uids*, by id, in store order.
+
+        Only user and assistant rows carry their content here (the version
+        rule reads it); other rows carry None.
+        """
+        wanted = sorted({uid for uid in uids if isinstance(uid, str) and uid})
+        where, args = self._message_uid_view_clause(view)
+        found: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"SELECT store_id, session_id, message_uid, role, "
+                f"CASE WHEN role IN ('user', 'assistant') THEN content END, tool_call_id, tool_calls "
+                f"FROM messages WHERE message_uid IN ({marks}) AND {where} ORDER BY store_id",
+                [*chunk, *args],
+            ).fetchall()
+            for store_id, row_session_id, uid, role, content, tool_call_id, tool_calls in rows:
+                if tool_calls:
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                found.setdefault(uid, []).append({
+                    "store_id": store_id,
+                    "session_id": row_session_id,
+                    "role": role,
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                    "tool_calls": tool_calls,
+                })
+        return found
+
+    def get_view_tail_without_message_uid(
+        self,
+        view: tuple[tuple[str, ...], str],
+        limit: int,
+        *,
+        max_store_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Rows without a host id, at or below *max_store_id*, among the newest *limit* rows of a view.
+
+        The view (sessions, conversation) is applied before the limit, so a
+        row of another conversation never takes a place in the window.
+        """
+        if limit <= 0 or max_store_id <= 0:
+            return []
+        where, args = self._message_uid_view_clause(view)
+        rows = self._conn.execute(
+            f"""SELECT store_id, session_id, role, content, tool_call_id, tool_calls, observed_at
+               FROM (
+                   SELECT store_id, session_id, role, content, tool_call_id, tool_calls, observed_at, message_uid
+                   FROM messages WHERE {where}
+                   ORDER BY store_id DESC LIMIT ?
+               )
+               WHERE message_uid IS NULL AND store_id <= ?
+               ORDER BY store_id""",
+            (*args, limit, max_store_id),
+        ).fetchall()
+        result = []
+        for store_id, row_session_id, role, content, tool_call_id, tool_calls, observed_at in rows:
+            if tool_calls:
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            result.append({
+                "store_id": store_id,
+                "session_id": row_session_id,
+                "role": role,
+                "content": content,
+                "tool_call_id": tool_call_id,
+                "tool_calls": tool_calls,
+                "observed_at": observed_at,
+            })
+        return result
+
+    def set_message_uids(self, view: tuple[tuple[str, ...], str], pairs: Iterable[tuple[int, str]]) -> list[int]:
+        """Write a host id into stored rows of the view (sessions, conversation) that have none.
+
+        Runs in the caller's transaction (``_append_protected_batch``). Returns
+        the number of changed rows for each pair: 0 means the row lies outside
+        the view or another writer gave it an id first; neither is a success.
+        """
+        where, args = self._message_uid_view_clause(view)
+        changed: list[int] = []
+        with self._write_lock:
+            for store_id, uid in pairs:
+                cur = self._conn.execute(
+                    "UPDATE messages SET message_uid = ? "
+                    f"WHERE store_id = ? AND message_uid IS NULL AND {where}",
+                    (uid, int(store_id), *args),
+                )
+                changed.append(int(cur.rowcount or 0))
+        return changed
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
@@ -975,14 +1200,14 @@ class MessageStore:
         after = 0
         while True:
             rows = self._conn.execute(
-                "SELECT store_id, session_id, role, content, tool_call_id, tool_calls, observed_at "
+                "SELECT store_id, session_id, role, content, tool_call_id, tool_calls, observed_at, message_uid "
                 "FROM messages WHERE session_id = ? AND store_id > ? "
                 "ORDER BY store_id LIMIT ?",
                 (session_id, after, batch_size),
             ).fetchall()
             if not rows:
                 return
-            for store_id, row_session_id, role, content, tool_call_id, tool_calls, observed_at in rows:
+            for store_id, row_session_id, role, content, tool_call_id, tool_calls, observed_at, message_uid in rows:
                 after = int(store_id)
                 if tool_calls:
                     try:
@@ -996,6 +1221,8 @@ class MessageStore:
                     "tool_call_id": tool_call_id,
                     "tool_calls": tool_calls,
                     "observed_at": observed_at,
+                    "message_uid": message_uid,
+                    "message_store_id": store_id,
                 }
 
     def get_session_count(self, session_id: str) -> int:
