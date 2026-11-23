@@ -46,7 +46,7 @@ from .ingest_protection import (
 )
 from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .sanitize import _clean_active_assistant_message
-from .store import _normalize_observed_at
+from .store import _normalize_observed_at, message_uids_of
 
 import logging
 
@@ -1129,6 +1129,13 @@ class ReconcileMixin:
         incoming_call_id_uses: dict[str, int] = {}
         incoming_tool_id_uses: dict[str, int] = {}
         alias_owner: dict[str, int] = {}
+        # Rows that the host id decides keep their place in both lists, but
+        # this rule takes no count and no neighbor from them: an incoming row
+        # whose ids the id rule decides, a stored row that carries such an id,
+        # and a stored row that the same incoming dict adopts.
+        decided_uids = getattr(self, "_ingest_held_message_uids", frozenset())
+        barrier_store_ids = getattr(self, "_ingest_barrier_store_ids", frozenset())
+        barriers: set[int] = set()
         for idx, msg in enumerate(messages):
             if (
                 self._is_replayed_context_scaffold_message(msg)
@@ -1137,6 +1144,10 @@ class ReconcileMixin:
                 # These are never persisted by _ingest_messages, so they can
                 # neither be a delta nor proof that something is stored.
                 skipped.add(idx)
+                continue
+            ids = message_uids_of(msg)
+            if ids and all(uid in decided_uids for uid in ids):
+                barriers.add(idx)
                 continue
             role = str(msg.get("role") or "unknown")
             tool_call_id = str(msg.get("tool_call_id") or "")
@@ -1193,6 +1204,9 @@ class ReconcileMixin:
         stored_rows = 0
         for row in self._store.iter_session_message_identities(self._session_id):
             stored_rows += 1
+            if row.get("message_uid") in decided_uids or row.get("message_store_id") in barrier_store_ids:
+                previous_neighbor_key, previous_text_key = None, None
+                continue
             role = str(row.get("role") or "unknown")
             tool_call_id = str(row.get("tool_call_id") or "")
             neighbor_key: tuple[Any, ...] | None = None
@@ -1359,6 +1373,8 @@ class ReconcileMixin:
         new_indices: list[int] = []
         already_stored = 0
         for position, idx in enumerate(effective):
+            if idx in barriers:
+                continue
             if idx in neighbor_keys:
                 if idx in proven_copies:
                     already_stored += 1

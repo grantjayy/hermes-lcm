@@ -16,7 +16,8 @@ import sys
 import threading
 import time
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Mapping
 import uuid
 from pathlib import Path
 from types import CodeType, FrameType
@@ -142,7 +143,7 @@ from .sqlite_util import (
     _sqlite_busy_timeout_ms,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore
+from .store import MessageStore, _normalize_observed_at, message_uid_value, message_uids_of
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -706,6 +707,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "action": "none",
             "reason": "not run",
         }
+        # Host message ids (message_uid) that the id rule decides in the list
+        # that _ingest_messages is deciding, and stored rows that an adoption
+        # by the same dict targets. The older rule keeps the positions of
+        # these rows but takes no count and no neighbor from them. Set before
+        # the older rule runs and cleared after it.
+        self._ingest_held_message_uids: frozenset[str] = frozenset()
+        self._ingest_barrier_store_ids: frozenset[int] = frozenset()
+        # Incoming rows decided by the host id, and by the older rule, since
+        # this engine started. get_status() reports both.
+        self._rows_decided_by_id = 0
+        self._rows_decided_by_rule = 0
+        # Compression rotations this engine carried over itself in this store:
+        # child session -> parent session. A read of the child shows the
+        # parent's raw rows through the carried summaries, so their ids count
+        # as held; the view's conversation filter (never empty for a bound
+        # session) applies to the parent too. Cleared when the engine rebinds
+        # to another home or store, and not kept across a restart: there the
+        # child stores the carried rows again.
+        self._compression_parent_session_ids: dict[str, str] = {}
+        # Dicts whose row this engine stored without a host id: id(dict) ->
+        # (dict, session_id, store_id). Hermes stamps the id onto the same dict
+        # object at its next flush; that object is the only proof that a row
+        # stored without an id and a row with an id are one message. The
+        # adoption UPDATE accepts the row only inside the view; the map is
+        # cleared with the rotation links on a home or store rebind.
+        self._rows_stored_without_uid: "OrderedDict[int, tuple[Dict[str, Any], str, int]]" = OrderedDict()
+        # True only while ingest() (the post_llm_call hook's entry) runs.
+        self._ingest_finalized_transcript = False
+        # The scaffold and ignore decision of each row of the last list that
+        # _ingest_messages processed to its end, beside the identities that
+        # _persisted_prefix_len compares and the pattern list that decided:
+        # (identities list, patterns, flags). A row below the scan start that
+        # the prefix proof shows unchanged reuses its flag under the same
+        # patterns instead of running the matcher again.
+        self._last_ingest_skip_flags: tuple[Any, Any, list[bool | None]] | None = None
 
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
@@ -1035,6 +1071,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._host_fallback_compressor = None
         self._host_fallback_session_id = ""
         self._host_fallback_import_warning_logged = False
+        # Identity proofs belong to one store: a rotation link or a remembered
+        # dict must not decide rows in the store of another home.
+        self._compression_parent_session_ids.clear()
+        self._rows_stored_without_uid.clear()
+        self._last_ingest_skip_flags = None
         self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 
@@ -1863,7 +1904,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     messages,
                     conversation_id=self._conversation_id,
                 )
-                self._ingest_messages(messages)
+                # The post_llm_call list is the finalized transcript of the
+                # turn: a changed text under a stored host id is a version.
+                self._ingest_finalized_transcript = True
+                try:
+                    self._ingest_messages(messages)
+                finally:
+                    self._ingest_finalized_transcript = False
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
@@ -2799,6 +2846,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # old/child session as missing even though its payload was only
             # reassigned to the next compression segment.
             moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
+            self._compression_parent_session_ids[session_id] = source_session_id
             logger.debug(
                 "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
@@ -4289,6 +4337,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["ignored_message_count"] = self._ignored_message_count
             status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
+            status["ingest_reconciliation"]["rows_decided_by_id"] = self._rows_decided_by_id
+            status["ingest_reconciliation"]["rows_decided_by_rule"] = self._rows_decided_by_rule
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
             status["conversation_id"] = conversation_id
@@ -4869,6 +4919,408 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
+    # -- Host message ids (message_uid) ----------------------------------------
+
+    def _host_id_view(self, session_id: str | None = None, conversation_id: str | None = None) -> tuple[tuple[str, ...], str]:
+        """The archive view in which a host id counts as held.
+
+        The sessions are the session itself and the compression parents that
+        this engine carried over in this store (their raw rows stay with the
+        parent). The conversation filter is the one a session read applies, to
+        every session of the view: rows of this conversation, or any
+        conversation when it is empty.
+        """
+        session_id = self._session_id if session_id is None else session_id
+        conversation_id = str((self._conversation_id if conversation_id is None else conversation_id) or "")
+        sessions = [session_id]
+        parent = self._compression_parent_session_ids.get(session_id)
+        while parent and parent not in sessions and len(sessions) < 64:
+            sessions.append(parent)
+            parent = self._compression_parent_session_ids.get(parent)
+        return tuple(sessions), conversation_id
+
+    # The host's visible text of a message (Hermes core
+    # session_rules/turns.py, flatten_message_text and its part helper).
+    _HOST_NON_TEXT_PART_TYPES = frozenset({"image", "image_url", "input_image", "audio", "input_audio"})
+    _HOST_TEXT_KEYS = ("text", "content", "input_text", "output_text", "summary_text")
+
+    @classmethod
+    def _host_visible_text(cls, content: Any) -> str:
+        """The text the host shows for a message content.
+
+        A string is itself. A list joins the text of its parts: a string part,
+        or the first string among the ``text``, ``content``, ``input_text``,
+        ``output_text`` and ``summary_text`` fields of a part; image and audio
+        parts give no text. Any other value gives the text of that one part,
+        or else its ``str()``.
+        """
+        def field(value: Any, key: str) -> Any:
+            return value.get(key) if isinstance(value, Mapping) else getattr(value, key, None)
+
+        def part_text(part: Any) -> str:
+            if part is None:
+                return ""
+            if isinstance(part, str):
+                return part
+            if str(field(part, "type") or "").strip().lower() in cls._HOST_NON_TEXT_PART_TYPES:
+                return ""
+            for key in cls._HOST_TEXT_KEYS:
+                text = field(part, key)
+                if isinstance(text, str):
+                    return text
+            return ""
+
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(chunk for chunk in map(part_text, content) if chunk)
+        text = part_text(content)
+        if text:
+            return text
+        try:
+            return str(content)
+        except Exception:  # content whose str() raises shows no text
+            return ""
+
+    @classmethod
+    def _host_blank_text(cls, content: Any, *, stored: bool = False) -> bool:
+        """The host's blank test: no visible text after strip.
+
+        A stored row holds a list or dict content as canonical JSON, so a
+        stored string that is such a container is decoded first.
+        """
+        if stored and isinstance(content, str) and content[:1] in ("[", "{"):
+            try:
+                decoded = json.loads(content)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (list, dict)) and normalize_content_value(decoded) == content:
+                content = decoded
+        return not cls._host_visible_text(content).strip()
+
+    def _remember_row_stored_without_uid(self, obj: Any, session_id: str, store_id: int) -> None:
+        if not isinstance(obj, dict) or message_uid_value(obj) is not None:
+            return
+        registry = self._rows_stored_without_uid
+        registry[id(obj)] = (obj, session_id, int(store_id))
+        registry.move_to_end(id(obj))
+        while len(registry) > 512:
+            registry.popitem(last=False)
+
+    def _row_stored_without_uid(self, obj: Any, session_id: str) -> int | None:
+        entry = self._rows_stored_without_uid.get(id(obj))
+        if entry is None or entry[0] is not obj or entry[1] != session_id:
+            return None
+        return entry[2]
+
+    def _prepare_host_id_decisions(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        view: tuple[tuple[str, ...], str],
+    ) -> Dict[str, Any]:
+        """Read what the id rule needs before the older rule runs.
+
+        Every read uses the archive view (sessions, conversation):
+        - the stored rows in the view that carry an id of the list;
+        - adoption by the same dict (proof 2): a row that this engine stored
+          without an id from this very dict object, which now has an id (the
+          adoption UPDATE accepts that row only when it lies in the view);
+        - adoption candidates of a row stored before this code (proof 1): a
+          plain row whose own id is not held, with a stored row without an id
+          at or below the first-open mark, same replay identity and host
+          timestamp, among the newest rows of the view. The older rule must
+          still call it stored, so it is not a barrier for the older rule.
+        Every other row with an id is decided by the id rule; the older rule
+        keeps its position and takes nothing from it.
+        """
+        list_ids = [uid for msg in messages for uid in message_uids_of(msg)]
+        uid_rows = self._store.message_uid_rows(list_ids, view=view) if list_ids else {}
+        same_dict: Dict[int, int] = {}
+        open_ids: list[int] = []
+        for idx, msg in enumerate(messages):
+            ids = message_uids_of(msg)
+            if not ids or ids[0] in uid_rows:
+                continue
+            if len(ids) == 1:
+                target = self._row_stored_without_uid(msg, view[0][0])
+                if target is not None:
+                    same_dict[idx] = target
+                else:
+                    open_ids.append(idx)
+        legacy_tail: list[Dict[str, Any]] = []
+        legacy_candidates: set[int] = set()
+        first_open = self._store.message_uid_first_open_store_id() if open_ids else 0
+        if open_ids and first_open > 0:
+            legacy_tail = self._store.get_view_tail_without_message_uid(
+                view, 2 * len(messages) + 64, max_store_id=first_open,
+            )
+            if legacy_tail:
+                keys = {self._pre_change_row_key(row, stored=True) for row in legacy_tail}
+                legacy_candidates = {
+                    idx for idx in open_ids if self._pre_change_row_key(messages[idx]) in keys
+                }
+        decided: set[str] = set()
+        for idx, msg in enumerate(messages):
+            if idx in legacy_candidates:
+                continue
+            decided.update(message_uids_of(msg))
+        return {
+            "view": view,
+            "uid_rows": uid_rows,
+            "same_dict": same_dict,
+            "legacy_tail": legacy_tail,
+            "legacy_candidates": legacy_candidates,
+            "decided": frozenset(decided),
+        }
+
+    def _pre_change_row_key(self, msg: Dict[str, Any], *, stored: bool = False) -> tuple[Any, ...]:
+        if stored:
+            return (
+                self._compute_message_replay_identity(msg, stored_row=True),
+                _normalize_observed_at(msg.get("observed_at")),
+            )
+        return (self._message_replay_identity(msg), _normalize_observed_at(msg.get("timestamp")))
+
+    def _settle_rows_by_host_id(
+        self,
+        messages: List[Dict[str, Any]],
+        rule_new_indices: List[int],
+        prepared: Dict[str, Any],
+        *,
+        skip_row: Callable[..., bool],
+        finalized: bool,
+    ) -> List[tuple[int, str | None, tuple[str, int] | None]]:
+        """Decide every row in input order; return the rows to store.
+
+        Each entry is ``(index, host id to store, plan)``. A row without an id
+        keeps the older rule's answer (``rule_new_indices``) and has no plan.
+        A row with an id is decided by its ids in the archive view, and a
+        decision made for an earlier row of this list counts for later rows:
+
+        - a plain row whose id is not held is new, unless it is adopted: the
+          same dict that this engine stored without an id (proof 2), or a row
+          stored before this code that the older rule calls stored and that
+          pairs with it (proof 1);
+        - a merged row is stored once for each of its ids that is not held,
+          one id on each stored row;
+        - a plain user or assistant row whose id is held is stored again as a
+          version when its text is not blank and either the list is the
+          finalized transcript and no stored row with that id holds this
+          replay text, or every stored row with that id is blank;
+        - any other row whose ids are all held is a copy.
+        This plan is a first reading. The write transaction decides every
+        planned row again against the rows the view holds at that moment
+        (``_host_version_decision``).
+
+        ``skip_row(idx, exact=...)`` says whether the scaffold test or the
+        ignore filters drop the row. A row with an id asks for the exact
+        answer before it is counted or planned; a row without an id takes the
+        answer that is known without new matcher work. Dropped rows are not
+        counted.
+        """
+        rule_new = set(rule_new_indices)
+        uid_rows: Dict[str, List[Dict[str, Any]]] = prepared["uid_rows"]
+        same_dict: Dict[int, int] = prepared["same_dict"]
+        legacy_adoptions = self._pair_with_rows_stored_before_this_code(
+            messages,
+            [idx for idx in sorted(prepared["legacy_candidates"]) if idx not in rule_new],
+            prepared["legacy_tail"],
+        )
+        batch_texts: Dict[str, list[tuple[str, bool]]] = {}
+
+        def held(uid: str) -> bool:
+            return uid in uid_rows or uid in batch_texts
+
+        entries: List[tuple[int, str | None, tuple[str, int] | None]] = []
+        by_id = by_rule = 0
+        for idx, msg in enumerate(messages):
+            ids = message_uids_of(msg)
+            if not ids:
+                # The older rule decides a row without an id, unchanged.
+                if idx in rule_new:
+                    entries.append((idx, None, None))
+                if not skip_row(idx, exact=False):
+                    by_rule += 1
+                continue
+            if skip_row(idx, exact=True):
+                continue
+            uid = ids[0]
+            missing = [one for one in ids if not held(one)]
+            planned: list[tuple[int, str | None, tuple[str, int] | None]] = []
+            if len(ids) > 1:
+                planned = [(idx, one, ("new", 0)) for one in missing]
+            elif missing:
+                if idx in same_dict:
+                    planned = [(idx, uid, ("adopt", same_dict[idx]))]
+                elif idx in legacy_adoptions:
+                    planned = [(idx, uid, ("adopt", legacy_adoptions[idx]))]
+                else:
+                    planned = [(idx, uid, ("new", 0))]
+            elif (
+                str(msg.get("role") or "") in ("user", "assistant")
+                and not self._host_blank_text(msg.get("content"))
+                and self._is_new_version(msg, uid_rows.get(uid, []), batch_texts.get(uid, []), finalized=finalized)
+            ):
+                planned = [(idx, uid, ("version", 0))]
+            if planned:
+                text = normalize_content_value(msg.get("content")) or ""
+                blank = self._host_blank_text(msg.get("content"))
+                for entry in planned:
+                    entries.append(entry)
+                    batch_texts.setdefault(entry[1], []).append((text, blank))
+            by_id += 1
+        self._rows_decided_by_id += by_id
+        self._rows_decided_by_rule += by_rule
+        return entries
+
+    def _host_version_decision(
+        self,
+        observations: List[tuple[Dict[str, Any], Dict[str, Any]]],
+        *,
+        finalized: bool,
+    ) -> Callable[[int, List[Dict[str, Any]]], bool]:
+        """The decision that the write transaction applies to a planned row whose id is held.
+
+        *observations* has one ``(incoming message, protected message)`` pair
+        for each row of the batch. ``_append_protected_batch`` calls the
+        returned function with the rows that hold the id in the view at that
+        moment: after an adoption (successful or not), for a planned new id
+        that another writer or an earlier row of the batch now holds, and for
+        a planned version. The row is stored again only as a version: a plain
+        user or assistant row (one id, not merged) whose text is not blank by
+        the host's test, whose protected text no held row has, and which
+        R7a (finalized transcript) or R7b (every held row blank) admits.
+        """
+        def decide(position: int, held_rows: List[Dict[str, Any]]) -> bool:
+            incoming, protected = observations[position]
+            if len(message_uids_of(incoming)) != 1:
+                return False
+            if str(incoming.get("role") or "") not in ("user", "assistant"):
+                return False
+            if self._host_blank_text(incoming.get("content")):
+                return False
+            protected_text = normalize_content_value(protected.get("content"))
+            if any(row.get("content") == protected_text for row in held_rows):
+                return False
+            return self._is_new_version(incoming, held_rows, [], finalized=finalized)
+
+        return decide
+
+    def _is_new_version(
+        self,
+        msg: Dict[str, Any],
+        stored_rows: List[Dict[str, Any]],
+        batch_texts: List[tuple[str, bool]],
+        *,
+        finalized: bool,
+    ) -> bool:
+        """Whether a held id's row is a version to store (the text is not blank).
+
+        On the finalized transcript: no stored row with the id holds this text,
+        compared first as stored text and then as replay text (the form that
+        redaction and externalization give both). On any other surface: every
+        stored row with the id is blank, so the first visible text is stored.
+        """
+        stored = [
+            (row.get("content"), self._host_blank_text(row.get("content"), stored=True))
+            for row in stored_rows
+        ]
+        if not finalized:
+            return all(blank for _text, blank in stored) and all(blank for _text, blank in batch_texts)
+        text = normalize_content_value(msg.get("content")) or ""
+        if any(stored_text == text for stored_text, _blank in stored) or any(
+            batch_text == text for batch_text, _blank in batch_texts
+        ):
+            return False
+        replay_text = self._message_replay_identity(msg)[1]
+        return all(
+            self._compute_message_replay_identity(row, stored_row=True)[1] != replay_text
+            for row in stored_rows
+        )
+
+    def _pair_with_rows_stored_before_this_code(
+        self,
+        messages: List[Dict[str, Any]],
+        indices: List[int],
+        legacy_tail: List[Dict[str, Any]],
+    ) -> Dict[int, int]:
+        """Pair rows that the older rule calls stored with rows stored before this code.
+
+        A pair needs the same replay identity and the same host timestamp (or
+        none on both). When one key has more incoming rows than stored rows,
+        the earliest incoming rows pair with the newest stored rows and the
+        rest stay new, because new rows arrive at the end.
+        Returns incoming index -> store_id.
+        """
+        if not indices or not legacy_tail:
+            return {}
+        stored_by_key: dict[tuple[Any, ...], list[int]] = {}
+        for row in legacy_tail:
+            stored_by_key.setdefault(self._pre_change_row_key(row, stored=True), []).append(int(row["store_id"]))
+        incoming_by_key: dict[tuple[Any, ...], list[int]] = {}
+        for idx in indices:
+            incoming_by_key.setdefault(self._pre_change_row_key(messages[idx]), []).append(idx)
+        paired: Dict[int, int] = {}
+        for key, incoming in incoming_by_key.items():
+            stored = stored_by_key.get(key, [])
+            count = min(len(incoming), len(stored))
+            for idx, store_id in zip(incoming[:count], stored[len(stored) - count:]):
+                paired[idx] = store_id
+        return paired
+
+    _HOST_IDENTITY_FIELDS = ("message_uid", "_absorbed_message_uids", "_tool_call_uids", "_tool_call_uid")
+
+    def _finish_host_identity(
+        self,
+        messages: List[Dict[str, Any]],
+        returned: List[Dict[str, Any]],
+        *,
+        skip_flags: List[bool | None] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Give each returned row the host identity fields of its incoming row.
+
+        A returned row can come from the cached replay of an earlier list,
+        which matches by text and can carry another message's id. The host
+        identity of a row is the incoming row's, never a cached one. The same
+        dict proof follows the row: when the incoming dict is one that this
+        engine stored without an id, the returned dict is remembered too,
+        because Hermes stamps the id onto the dict that it continues with.
+
+        ``skip_flags`` (the scaffold and ignore decision of each incoming row)
+        is kept beside the identities of this list, for the next call's rows
+        below its scan start.
+        """
+        if skip_flags is not None and len(skip_flags) == len(messages):
+            self._last_ingest_skip_flags = (
+                getattr(self, "_last_active_replay_source_identities", None),
+                self._compiled_ignore_message_patterns,
+                list(skip_flags),
+            )
+        if len(returned) != len(messages):
+            return returned
+        result = returned
+        for idx, (incoming, out) in enumerate(zip(messages, returned)):
+            if not isinstance(incoming, dict) or not isinstance(out, dict) or incoming is out:
+                continue
+            if any(incoming.get(field) != out.get(field) for field in self._HOST_IDENTITY_FIELDS):
+                copied = dict(out)
+                for field in self._HOST_IDENTITY_FIELDS:
+                    if field in incoming:
+                        copied[field] = incoming[field]
+                    else:
+                        copied.pop(field, None)
+                if result is returned:
+                    result = list(returned)
+                result[idx] = copied
+                out = copied
+            entry = self._rows_stored_without_uid.get(id(incoming))
+            if entry is not None and entry[0] is incoming and message_uid_value(incoming) is None:
+                self._remember_row_stored_without_uid(out, entry[1], entry[2])
+        return result
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -4895,6 +5347,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
+        finalized = bool(getattr(self, "_ingest_finalized_transcript", False))
+        host_view = self._host_id_view()
+        host_prepared = self._prepare_host_id_decisions(messages, view=host_view)
+        self._ingest_held_message_uids = host_prepared["decided"]
+        self._ingest_barrier_store_ids = frozenset(host_prepared["same_dict"].values())
+        # The ignore decisions of the last list, valid for this list's rows
+        # as far as _persisted_prefix_len (below) proves them unchanged.
+        previous_skip_flags = self._last_ingest_skip_flags
+        previous_identities = getattr(self, "_last_active_replay_source_identities", None)
         persisted_prefix_len = self._persisted_prefix_len(messages)
         self._verify_ingest_cursor_against_returned_list(messages, persisted_prefix_len)
         cursor = min(max(self._ingest_cursor, 0), n)
@@ -4933,6 +5394,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        # The cached-prefix step below can replace rows before the cursor with
+        # the replay form of an earlier list. A row that the host id then
+        # proves new must be stored in its own form.
+        own_replay_messages = replay_messages
         # Turn-start cost: memoise replay identities for the reconcile +
         # cached-prefix checks, which re-identify the same rows several times.
         with self._replay_identity_memo_scope():
@@ -4992,6 +5457,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                             )
                             + replay_messages[cursor:]
                         )
+        self._ingest_held_message_uids = frozenset()
+        self._ingest_barrier_store_ids = frozenset()
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
@@ -5008,6 +5475,58 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             new_message_indices = [
                 idx for idx in pending_persist_indices if cursor <= idx < n
             ]
+        # Rows below the scan start that _persisted_prefix_len proves equal to
+        # the last list keep that list's decision, under the same patterns.
+        reusable_skip_flags: list[bool | None] = []
+        if (
+            previous_skip_flags is not None
+            and previous_identities is not None
+            and previous_skip_flags[0] is previous_identities
+            and previous_skip_flags[1] is self._compiled_ignore_message_patterns
+            and persisted_prefix_len
+        ):
+            reusable_skip_flags = previous_skip_flags[2][: min(persisted_prefix_len, scan_start)]
+        skip_flags: list[bool | None] = [None] * n
+
+        def skip_host_id_row(idx: int, *, exact: bool) -> bool:
+            # The scaffold test and the ignore filters judge the row's own form
+            # before any id step. The scan above decided rows from the scan
+            # start on. Below it, an unchanged row keeps the last list's
+            # decision; another row with an id is matched now, because the id
+            # rule counts or stores it (exact). A row without an id below the
+            # scan start keeps the older rule's cost: no new matcher run.
+            known = skip_flags[idx]
+            if known is not None:
+                return known
+            msg = messages[idx]
+            if ignored_original_messages[idx] or self._is_replayed_context_scaffold_message(msg):
+                decided = True
+            elif idx >= scan_start or not self._compiled_ignore_message_patterns:
+                decided = False
+            elif idx < len(reusable_skip_flags) and reusable_skip_flags[idx] is not None:
+                decided = bool(reusable_skip_flags[idx])
+            elif not exact:
+                return False
+            else:
+                decided = self._matches_ignore_message_patterns(msg)
+            skip_flags[idx] = decided
+            return decided
+
+        host_entries = self._settle_rows_by_host_id(
+            messages,
+            new_message_indices,
+            host_prepared,
+            skip_row=skip_host_id_row,
+            finalized=finalized,
+        )
+        new_message_indices = [idx for idx, _uid, _plan in host_entries]
+        host_entry_plans = [(uid, plan) for _idx, uid, plan in host_entries]
+        if replay_messages is not own_replay_messages:
+            restored = sorted({idx for idx in new_message_indices if idx < cursor})
+            if restored:
+                replay_messages = list(replay_messages)
+                for idx in restored:
+                    replay_messages[idx] = own_replay_messages[idx]
         new_messages = [replay_messages[idx] for idx in new_message_indices]
         original_new_messages = [messages[idx] for idx in new_message_indices]
 
@@ -5019,8 +5538,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
             if cached_replay is not None:
-                return cached_replay
-            return self._remember_active_replay_messages(messages, replay_messages)
+                return self._finish_host_identity(messages, cached_replay, skip_flags=skip_flags)
+            return self._finish_host_identity(
+                messages,
+                self._remember_active_replay_messages(messages, replay_messages),
+                skip_flags=skip_flags,
+            )
 
         active_replay_messages = replay_messages
         compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
@@ -5037,8 +5560,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
             (idx, replay_messages[idx]) for idx in new_message_indices
         ]
+        kept_plans: list[tuple[str, int] | None] = [plan for _uid, plan in host_entry_plans]
         if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
+            kept_plans = []
             boundary_placeholder_seen: dict[str, int] = {}
             boundary_seen_synthetic_summary_before = False
             empty_session_placeholder_seen: dict[str, int] = {}
@@ -5090,9 +5615,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     for msg in new_messages
                 )
             )
-            for absolute_idx, original_msg, replay_msg in zip(
+            for position, (absolute_idx, original_msg, replay_msg) in enumerate(zip(
                 new_message_indices, original_new_messages, new_messages
-            ):
+            )):
+                storage_uid, uid_plan = host_entry_plans[position]
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
@@ -5239,7 +5765,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 ):
                     store_msg = original_msg
+                if storage_uid != message_uid_value(store_msg):
+                    store_msg = {**store_msg, "message_uid": storage_uid}
                 kept.append((absolute_idx, store_msg))
+                kept_plans.append(uid_plan)
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
@@ -5249,7 +5778,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._finish_host_identity(
+                messages,
+                self._remember_active_replay_messages(messages, active_replay_messages),
+                skip_flags=skip_flags,
+            )
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -5287,13 +5820,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
+        stored_ids = self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            uid_plan=kept_plans,
+            uid_view=host_view,
+            held_decision=self._host_version_decision(
+                [
+                    (messages[absolute_idx], protected_msg)
+                    for (absolute_idx, _store_msg), protected_msg in zip(
+                        messages_to_store_with_index, protected_messages
+                    )
+                ],
+                finalized=finalized,
+            ),
         )
+        for (absolute_idx, _store_msg), protected_msg, store_id in zip(
+            messages_to_store_with_index, protected_messages, stored_ids
+        ):
+            if store_id is not None and message_uid_value(protected_msg) is None:
+                self._remember_row_stored_without_uid(messages[absolute_idx], self._session_id, store_id)
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -5310,7 +5859,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # data/base64 substrings stay provider-usable in active replay. The
         # exceptions are whole-message ``raw_payload`` externalization and the
         # separately opt-in textual tool-result interceptor above.
-        return self._remember_active_replay_messages(messages, active_replay_messages)
+        return self._finish_host_identity(
+            messages,
+            self._remember_active_replay_messages(messages, active_replay_messages),
+            skip_flags=skip_flags,
+        )
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
