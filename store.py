@@ -671,7 +671,7 @@ class MessageStore:
                                 uid_plan: List[tuple[str, int] | None] | None = None,
                                 uid_view: tuple[tuple[str, ...], str] | None = None,
                                 held_decision: Callable[[int, List[Dict[str, Any]]], bool] | None = None,
-                                ) -> List[int | None]:
+                                ) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
